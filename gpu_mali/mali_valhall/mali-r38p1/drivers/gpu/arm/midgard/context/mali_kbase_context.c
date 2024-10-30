@@ -123,22 +123,28 @@ static int kbase_insert_kctx_to_process(struct kbase_context *kctx)
 
 int kbase_context_common_init(struct kbase_context *kctx)
 {
+#if IS_ENABLED(CONFIG_MALI_MTK_NETFLIX_SCHEDULER_TIMER_WA) && MALI_USE_CSF
+	struct task_struct *task;
+	struct pid *pid_struct;
+	struct kbase_csf_scheduler *scheduler;
+#endif
 	const unsigned long cookies_mask = KBASE_COOKIE_MASK;
 	int err = 0;
 #if IS_ENABLED(CONFIG_MALI_MTK_ACP_SVP_WA)
-		int i;
+	int i;
 
-		mutex_init(&kctx->coherenct_region_lock);
-		for (i = 0; i < MAX_COHERENT_REGION; i++)
-			kctx->coherenct_regions[i] = NULL;
+	mutex_init(&kctx->coherenct_region_lock);
+	kctx->coherenct_regions =
+		kmalloc(DEFAULT_COHERENT_REGION_SIZE * sizeof(struct kbase_va_region *), GFP_KERNEL);
+	kctx->coherent_region_nr = DEFAULT_COHERENT_REGION_SIZE;
+	if (!kctx->coherenct_regions)
+		return -ENOMEM;
+	for (i = 0; i < kctx->coherent_region_nr; i++)
+		kctx->coherenct_regions[i] = NULL;
 #endif
 
 	/* creating a context is considered a disjoint event */
 	kbase_disjoint_event(kctx->kbdev);
-
-	kctx->as_nr = KBASEP_AS_NR_INVALID;
-
-	atomic_set(&kctx->refcount, 0);
 
 	spin_lock_init(&kctx->mm_update_lock);
 	kctx->process_mm = NULL;
@@ -146,6 +152,23 @@ int kbase_context_common_init(struct kbase_context *kctx)
 	atomic_set(&kctx->permanent_mapped_pages, 0);
 	kctx->tgid = current->tgid;
 	kctx->pid = current->pid;
+
+#if IS_ENABLED(CONFIG_MALI_MTK_NETFLIX_SCHEDULER_TIMER_WA) && MALI_USE_CSF
+	kctx->scheduler_timer_WA = false;
+
+	rcu_read_lock();
+	pid_struct = find_get_pid(kctx->tgid);
+	task = pid_task(pid_struct, PIDTYPE_PID);
+	if (task)
+		strcpy(kctx->process_name, task->comm);
+	else
+		strcpy(kctx->process_name, current->comm);
+	put_pid(pid_struct);
+	rcu_read_unlock();
+
+	if (strcmp("lix.mediaclient", kctx->process_name) == 0) // Netflix white list
+		kctx->scheduler_timer_WA = true;
+#endif
 
 	atomic_set(&kctx->used_pages, 0);
 
@@ -162,7 +185,7 @@ int kbase_context_common_init(struct kbase_context *kctx)
 
 #if !MALI_USE_CSF
 	atomic_set(&kctx->event_closed, false);
-#if IS_ENABLED(CONFIG_GPU_TRACEPOINTS)
+#if IS_ENABLED(CONFIG_GPU_TRACEPOINTS) || IS_ENABLED(CONFIG_MALI_MTK_GPU_BM_JM)
 	atomic_set(&kctx->jctx.work_id, 0);
 #endif
 #endif
@@ -176,6 +199,22 @@ int kbase_context_common_init(struct kbase_context *kctx)
 
 	kctx->id = atomic_add_return(1, &(kctx->kbdev->ctx_num)) - 1;
 
+#if IS_ENABLED(CONFIG_MALI_MTK_NETFLIX_SCHEDULER_TIMER_WA) && MALI_USE_CSF
+	dev_vdbg(kctx->kbdev->dev, "[MTK-debug] Created context %d_%d for process %s",
+			kctx->tgid, kctx->id, kctx->process_name);
+
+	if (kctx->scheduler_timer_WA) {
+		scheduler = &kctx->kbdev->csf.scheduler;
+		if (scheduler) {
+			scheduler->csg_scheduling_period_ms = 4;
+			dev_vdbg(kctx->kbdev->dev, "[MTK-debug] Created context CSG scheduling period: %ums\n", 4);
+		}
+		else {
+			dev_vdbg(kctx->kbdev->dev, "[MTK-debug] Created context no scheduler\n");
+		}
+	}
+#endif
+
 	mutex_lock(&kctx->kbdev->kctx_list_lock);
 
 	err = kbase_insert_kctx_to_process(kctx);
@@ -185,6 +224,7 @@ int kbase_context_common_init(struct kbase_context *kctx)
 
 	mutex_unlock(&kctx->kbdev->kctx_list_lock);
 
+	kctx->has_page_faults = false;
 	return err;
 }
 
@@ -260,23 +300,36 @@ static void kbase_remove_kctx_from_process(struct kbase_context *kctx)
 
 void kbase_context_common_term(struct kbase_context *kctx)
 {
-	unsigned long flags;
 	int pages;
+#if IS_ENABLED(CONFIG_MALI_MTK_NETFLIX_SCHEDULER_TIMER_WA) && MALI_USE_CSF
+	struct kbase_csf_scheduler *scheduler;
+#endif
 #if IS_ENABLED(CONFIG_MALI_MTK_ACP_SVP_WA)
 	int i;
 
-	for (i = 0; i < MAX_COHERENT_REGION; i++)
+	for (i = 0; i < kctx->coherent_region_nr; i++)
 		kctx->coherenct_regions[i] = NULL;
+	kfree(kctx->coherenct_regions);
+	dev_vdbg(kctx->kbdev->dev, "%s: %d free coherent list: %u!\n", __func__,
+		kctx->tgid, kctx->coherent_region_nr);
 	mutex_destroy(&kctx->coherenct_region_lock);
 #endif
 
-	mutex_lock(&kctx->kbdev->mmu_hw_mutex);
-	spin_lock_irqsave(&kctx->kbdev->hwaccess_lock, flags);
-	kbase_ctx_sched_remove_ctx(kctx);
-	spin_unlock_irqrestore(&kctx->kbdev->hwaccess_lock, flags);
-	mutex_unlock(&kctx->kbdev->mmu_hw_mutex);
-
 	pages = atomic_read(&kctx->used_pages);
+#if IS_ENABLED(CONFIG_MALI_MTK_NETFLIX_SCHEDULER_TIMER_WA) && MALI_USE_CSF
+	if (kctx->scheduler_timer_WA) {
+		scheduler = &kctx->kbdev->csf.scheduler;
+		if (scheduler) {
+			scheduler->csg_scheduling_period_ms = CSF_SCHEDULER_TIME_TICK_MS;
+			dev_vdbg(kctx->kbdev->dev, "[MTK-debug] Deleted context CSG scheduling period: %ums\n", CSF_SCHEDULER_TIME_TICK_MS);
+		}
+		else {
+			dev_vdbg(kctx->kbdev->dev, "[MTK-debug] Deleted context no scheduler\n");
+		}
+	}
+	dev_vdbg(kctx->kbdev->dev, "[MTK-debug] Deleted context %d_%d",
+			kctx->tgid, kctx->id);
+#endif
 	if (pages != 0)
 		dev_warn(kctx->kbdev->dev,
 			"%s: %d pages in use!\n", __func__, pages);

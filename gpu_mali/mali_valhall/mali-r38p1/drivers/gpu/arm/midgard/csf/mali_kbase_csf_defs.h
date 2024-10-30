@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
 /*
  *
- * (C) COPYRIGHT 2018-2022 ARM Limited. All rights reserved.
+ * (C) COPYRIGHT 2018-2023 ARM Limited. All rights reserved.
  *
  * This program is free software and is provided to you under the terms of the
  * GNU General Public License version 2 as published by the Free Software
@@ -28,6 +28,11 @@
 
 #include <linux/types.h>
 #include <linux/wait.h>
+#if IS_ENABLED(CONFIG_MALI_MTK_PENDING_SUBMISSION_MODE)
+#include <linux/sched.h>
+#include <uapi/linux/sched/types.h>
+#include <linux/kthread.h>
+#endif /* CONFIG_MALI_MTK_PENDING_SUBMISSION_MODE */
 
 #include "mali_kbase_csf_firmware.h"
 #include "mali_kbase_csf_event.h"
@@ -264,6 +269,9 @@ enum kbase_queue_group_priority {
  * @CSF_FIRMWARE_PING_TIMEOUT: Maximum time to wait for firmware to respond
  *                             to a ping from KBase.
  * @CSF_SCHED_PROTM_PROGRESS_TIMEOUT: Timeout used to prevent protected mode execution hang.
+ * @MMU_AS_INACTIVE_WAIT_TIMEOUT: Maximum waiting time in ms for the completion
+ *                                of a MMU operation
+ * @KCPU_FENCE_SIGNAL_TIMEOUT: Waiting time in ms for triggering a KCPU queue sync state dump
  * @KBASE_TIMEOUT_SELECTOR_COUNT: Number of timeout selectors. Must be last in
  *                                the enum.
  */
@@ -275,6 +283,8 @@ enum kbase_timeout_selector {
 	CSF_FIRMWARE_BOOT_TIMEOUT,
 	CSF_FIRMWARE_PING_TIMEOUT,
 	CSF_SCHED_PROTM_PROGRESS_TIMEOUT,
+	MMU_AS_INACTIVE_WAIT_TIMEOUT,
+	KCPU_FENCE_SIGNAL_TIMEOUT,
 
 	/* Must be the last in the enum */
 	KBASE_TIMEOUT_SELECTOR_COUNT
@@ -506,9 +516,6 @@ struct kbase_queue_group {
 	u8 handle;
 	s8 csg_nr;
 	u8 priority;
-	u8 prio_boost; // 0: normal mode, 1: protect mode, 2: ready to leave
-	struct timer_list protm_sched_timeout;
-	bool protm_boost;
 
 	u8 tiler_max;
 	u8 fragment_max;
@@ -603,6 +610,8 @@ struct kbase_csf_cpu_queue_context {
  * @lock:     Lock preventing concurrent access to the @in_use bitmap.
  * @in_use:   Bitmap that indicates which heap context structures are currently
  *            allocated (in @region).
+ * @heap_context_size_aligned: Size of a heap context structure, in bytes,
+ *                             aligned to GPU cacheline size.
  *
  * Heap context structures are allocated by the kernel for use by the firmware.
  * The current implementation subdivides a single GPU memory region for use as
@@ -614,6 +623,7 @@ struct kbase_csf_heap_context_allocator {
 	u64 gpu_va;
 	struct mutex lock;
 	DECLARE_BITMAP(in_use, MAX_TILER_HEAPS);
+	u32 heap_context_size_aligned;
 };
 
 /**
@@ -809,6 +819,12 @@ struct kbase_csf_context {
 	struct list_head link;
 	struct vm_area_struct *user_reg_vma;
 	struct kbase_csf_scheduler_context sched;
+#if IS_ENABLED(CONFIG_MALI_MTK_PENDING_SUBMISSION_MODE)
+	u32 pending_submission_mode;
+	struct task_struct *pending_submission_work_kthread;
+	wait_queue_head_t pending_wait_queue;
+	atomic_t trigger_submission;
+#endif /* CONFIG_MALI_MTK_PENDING_SUBMISSION_MODE */
 	struct work_struct pending_submission_work;
 #if IS_ENABLED(CONFIG_DEBUG_FS)
 	struct kbase_csf_cpu_queue_context cpu_queue;
@@ -1040,6 +1056,7 @@ struct kbase_csf_scheduler {
 	struct kbase_queue_group *active_protm_grp;
 	struct work_struct pmode_exit_wa_work;
 	bool apply_pmode_exit_wa;
+	bool under_pmode_process;
 	struct workqueue_struct *idle_wq;
 	struct work_struct gpu_idle_work;
 	bool fast_gpu_idle_handling;
@@ -1052,7 +1069,6 @@ struct kbase_csf_scheduler {
 	u32 tick_protm_pending_seq;
 	ktime_t protm_enter_time;
 	struct kbase_csf_sched_heap_reclaim_mgr reclaim_mgr;
-	struct kbase_queue_group *active_protm_grp_bkup;
 };
 
 /*
@@ -1436,9 +1452,9 @@ struct kbase_csf_firmware_log {
  *                              the glb_pwoff register. This is separated from
  *                              the @p mcu_core_pwroff_dur_count as an update
  *                              to the latter is asynchronous.
- * @gpu_idle_hysteresis_ms: Sysfs attribute for the idle hysteresis time
- *                          window in unit of ms. The firmware does not use it
- *                          directly.
+ * @gpu_idle_hysteresis_us: Sysfs attribute for the idle hysteresis time
+ *                          window in unit of microseconds. The firmware does not
+ *                          use it directly.
  * @gpu_idle_dur_count:     The counterpart of the hysteresis time window in
  *                          interface required format, ready to be used
  *                          directly in the firmware.
@@ -1526,6 +1542,10 @@ struct kbase_csf_device {
  * @bf_data:           Data relating to Bus fault.
  * @gf_data:           Data relating to GPU fault.
  * @current_setup:     Stores the MMU configuration for this address space.
+ * @is_unresponsive:   Flag to indicate MMU is not responding.
+ *                     Set if a MMU command isn't completed within
+ *                     &kbase_device:mmu_as_inactive_wait_time_ms.
+ *                     Clear by kbase_ctx_sched_restore_all_as() after GPU reset completes.
  */
 struct kbase_as {
 	int number;
@@ -1537,6 +1557,7 @@ struct kbase_as {
 	struct kbase_fault bf_data;
 	struct kbase_fault gf_data;
 	struct kbase_mmu_setup current_setup;
+	bool is_unresponsive;
 };
 
 #endif /* _KBASE_CSF_DEFS_H_ */

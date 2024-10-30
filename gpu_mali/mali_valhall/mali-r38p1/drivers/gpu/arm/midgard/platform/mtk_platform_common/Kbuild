@@ -41,6 +41,17 @@ ifeq ($(CONFIG_MALI_MTK_IRQ_TRACE),y)
     mali_kbase-y += $(curr)/mtk_platform_irq_trace.o
 endif ## CONFIG_MALI_MTK_IRQ_TRACE ##
 
+ifeq ($(CONFIG_MALI_MTK_PENDING_SUBMISSION_MODE),y)
+    mali_kbase-y += $(curr)/mtk_platform_pending_submission.o
+endif ## CONFIG_MALI_MTK_PENDING_SUBMISSION_MODE ##
+ifeq ($(CONFIG_MALI_MTK_RECLAIM_POLICY),y)
+	mali_kbase-y += $(curr)/mtk_platform_reclaim_policy.o
+endif ## CONFIG_MALI_MTK_RECLAIM_POLICY ##
+
+ifeq ($(CONFIG_MALI_MTK_MEM_ALLOCATE_POLICY),y)
+	mali_kbase-y += $(curr)/mtk_platform_mem_allocate_policy.o
+endif ## CONFIG_MALI_MTK_MEM_ALLOCATE_POLICY ##
+
 ccflags-y += -I$(srctree)/drivers/devfreq/
 ccflags-y += -I$(srctree)/drivers/misc/mediatek/perf_common/
 ccflags-y += -I$(srctree)/drivers/misc/mediatek/tinysys_scmi/

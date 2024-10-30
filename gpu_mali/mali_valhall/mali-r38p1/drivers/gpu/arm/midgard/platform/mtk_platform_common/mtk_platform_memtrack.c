@@ -57,6 +57,13 @@ static int mtk_gpu_memory_show(struct seq_file *m, void *v)
 		           atomic_read(&(kctx->used_pages)),
 		           kctx->tgid);
 	}
+
+#if IS_ENABLED(CONFIG_MALI_MTK_MEM_ALLOCATE_POLICY)
+	seq_printf(m, "[%u] r0 %10u, r1 %10u, waste: %10u/%u --- %d\n", kbdev->memdev.ratio,
+		kbdev->memdev.nr_rank[0], kbdev->memdev.nr_rank[1],
+		kbdev->memdev.nr_waste_list, kbdev->memdev.waste_target, kbdev->memdev.bDisWA);
+#endif
+
 	mutex_unlock(&kbdev->kctx_list_lock);
 
 out_lock_held:

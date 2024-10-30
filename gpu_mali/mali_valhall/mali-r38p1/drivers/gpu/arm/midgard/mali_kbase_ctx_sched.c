@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note
 /*
  *
- * (C) COPYRIGHT 2017-2022 ARM Limited. All rights reserved.
+ * (C) COPYRIGHT 2017-2023 ARM Limited. All rights reserved.
  *
  * This program is free software and is provided to you under the terms of the
  * GNU General Public License version 2 as published by the Free Software
@@ -67,6 +67,12 @@ void kbase_ctx_sched_term(struct kbase_device *kbdev)
 		WARN_ON(kbdev->as_to_kctx[i] != NULL);
 		WARN_ON(!(kbdev->as_free & (1u << i)));
 	}
+}
+
+void kbase_ctx_sched_init_ctx(struct kbase_context *kctx)
+{
+	kctx->as_nr = KBASEP_AS_NR_INVALID;
+	atomic_set(&kctx->refcount, 0);
 }
 
 /* kbasep_ctx_sched_find_as_for_ctx - Find a free address space
@@ -202,8 +208,10 @@ void kbase_ctx_sched_remove_ctx(struct kbase_context *kctx)
 {
 	struct kbase_device *const kbdev = kctx->kbdev;
 
-	lockdep_assert_held(&kbdev->mmu_hw_mutex);
-	lockdep_assert_held(&kbdev->hwaccess_lock);
+	unsigned long flags;
+
+	mutex_lock(&kbdev->mmu_hw_mutex);
+	spin_lock_irqsave(&kbdev->hwaccess_lock, flags);
 
 	WARN_ON(atomic_read(&kctx->refcount) != 0);
 
@@ -215,6 +223,9 @@ void kbase_ctx_sched_remove_ctx(struct kbase_context *kctx)
 		kbdev->as_to_kctx[kctx->as_nr] = NULL;
 		kctx->as_nr = KBASEP_AS_NR_INVALID;
 	}
+
+	spin_unlock_irqrestore(&kbdev->hwaccess_lock, flags);
+	mutex_unlock(&kbdev->mmu_hw_mutex);
 }
 
 void kbase_ctx_sched_restore_all_as(struct kbase_device *kbdev)
@@ -229,6 +240,7 @@ void kbase_ctx_sched_restore_all_as(struct kbase_device *kbdev)
 	for (i = 0; i != kbdev->nr_hw_address_spaces; ++i) {
 		struct kbase_context *kctx;
 
+		kbdev->as[i].is_unresponsive = false;
 #if MALI_USE_CSF
 		if ((i == MCU_AS_NR) && kbdev->csf.firmware_inited) {
 			kbase_mmu_update(kbdev, &kbdev->csf.mcu_mmu,
@@ -383,39 +395,3 @@ void kbase_ctx_sched_release_ctx_lock(struct kbase_context *kctx)
 	spin_unlock_irqrestore(&kctx->kbdev->hwaccess_lock, flags);
 }
 
-#if MALI_USE_CSF
-bool kbase_ctx_sched_inc_refcount_if_as_valid(struct kbase_context *kctx)
-{
-	struct kbase_device *kbdev;
-	bool added_ref = false;
-	unsigned long flags;
-
-	if (WARN_ON(kctx == NULL))
-		return added_ref;
-
-	kbdev = kctx->kbdev;
-
-	if (WARN_ON(kbdev == NULL))
-		return added_ref;
-
-	mutex_lock(&kbdev->mmu_hw_mutex);
-	spin_lock_irqsave(&kbdev->hwaccess_lock, flags);
-
-	if ((kctx->as_nr != KBASEP_AS_NR_INVALID) &&
-	    (kctx == kbdev->as_to_kctx[kctx->as_nr])) {
-		atomic_inc(&kctx->refcount);
-
-		if (kbdev->as_free & (1u << kctx->as_nr))
-			kbdev->as_free &= ~(1u << kctx->as_nr);
-
-		KBASE_KTRACE_ADD(kbdev, SCHED_RETAIN_CTX_NOLOCK, kctx,
-				 kbase_ktrace_get_ctx_refcnt(kctx));
-		added_ref = true;
-	}
-
-	spin_unlock_irqrestore(&kbdev->hwaccess_lock, flags);
-	mutex_unlock(&kbdev->mmu_hw_mutex);
-
-	return added_ref;
-}
-#endif

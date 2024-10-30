@@ -60,6 +60,15 @@ int kbase_ctx_sched_init(struct kbase_device *kbdev);
 void kbase_ctx_sched_term(struct kbase_device *kbdev);
 
 /**
+ * kbase_ctx_sched_ctx_init - Initialize per-context data fields for scheduling
+ * @kctx: The context to initialize
+ *
+ * This must be called during context initialization before any other context
+ * scheduling functions are called on @kctx
+ */
+void kbase_ctx_sched_init_ctx(struct kbase_context *kctx);
+
+/**
  * kbase_ctx_sched_retain_ctx - Retain a reference to the @ref kbase_context
  * @kctx: The context to which to retain a reference
  *
@@ -113,9 +122,6 @@ void kbase_ctx_sched_release_ctx(struct kbase_context *kctx);
  * This function should be called when a context is being destroyed. The
  * context must no longer have any reference. If it has been assigned an
  * address space before then the AS will be unprogrammed.
- *
- * The kbase_device::mmu_hw_mutex and kbase_device::hwaccess_lock locks must be
- * held whilst calling this function.
  */
 void kbase_ctx_sched_remove_ctx(struct kbase_context *kctx);
 
@@ -219,23 +225,5 @@ bool kbase_ctx_sched_inc_refcount(struct kbase_context *kctx);
  * kbase_device::hwaccess_lock is required NOT to be locked.
  */
 void kbase_ctx_sched_release_ctx_lock(struct kbase_context *kctx);
-
-#if MALI_USE_CSF
-/**
- * kbase_ctx_sched_inc_refcount_if_as_valid - Refcount the context if it has GPU
- *                                            address space slot assigned to it.
- *
- * @kctx: Context to be refcounted
- *
- * This function takes a reference on the context if it has a GPU address space
- * slot assigned to it. The address space slot will not be available for
- * re-assignment until the reference is released.
- *
- * Return: true if refcount succeeded and the address space slot will not be
- * reassigned, false if the refcount failed (because the address space slot
- * was not assigned).
- */
-bool kbase_ctx_sched_inc_refcount_if_as_valid(struct kbase_context *kctx);
-#endif
 
 #endif /* _KBASE_CTX_SCHED_H_ */

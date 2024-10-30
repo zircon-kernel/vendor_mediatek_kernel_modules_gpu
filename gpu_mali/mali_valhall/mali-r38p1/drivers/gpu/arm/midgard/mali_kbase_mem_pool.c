@@ -65,6 +65,10 @@ static void kbase_mem_pool_add_locked(struct kbase_mem_pool *pool,
 	pool->cur_size++;
 
 	pool_dbg(pool, "added page\n");
+
+#if IS_ENABLED(CONFIG_MALI_MTK_COMMON)
+	mod_node_page_state(page_pgdat(p), NR_KERNEL_MISC_RECLAIMABLE, 1 << pool->order);
+#endif /* CONFIG_MALI_MTK_COMMON */
 }
 
 static void kbase_mem_pool_add(struct kbase_mem_pool *pool, struct page *p)
@@ -77,12 +81,21 @@ static void kbase_mem_pool_add(struct kbase_mem_pool *pool, struct page *p)
 static void kbase_mem_pool_add_list_locked(struct kbase_mem_pool *pool,
 		struct list_head *page_list, size_t nr_pages)
 {
+#if IS_ENABLED(CONFIG_MALI_MTK_COMMON)
+	struct page *p;
+#endif /* CONFIG_MALI_MTK_COMMON */
+
 	lockdep_assert_held(&pool->pool_lock);
 
 	list_splice(page_list, &pool->page_list);
 	pool->cur_size += nr_pages;
 
 	pool_dbg(pool, "added %zu pages\n", nr_pages);
+
+#if IS_ENABLED(CONFIG_MALI_MTK_COMMON)
+	p = list_first_entry(&pool->page_list, struct page, lru);
+	mod_node_page_state(page_pgdat(p), NR_KERNEL_MISC_RECLAIMABLE, nr_pages << pool->order);
+#endif /* CONFIG_MALI_MTK_COMMON */
 }
 
 static void kbase_mem_pool_add_list(struct kbase_mem_pool *pool,
@@ -103,6 +116,11 @@ static struct page *kbase_mem_pool_remove_locked(struct kbase_mem_pool *pool)
 		return NULL;
 
 	p = list_first_entry(&pool->page_list, struct page, lru);
+
+#if IS_ENABLED(CONFIG_MALI_MTK_COMMON)
+	mod_node_page_state(page_pgdat(p), NR_KERNEL_MISC_RECLAIMABLE, -(1 << pool->order));
+#endif /* CONFIG_MALI_MTK_COMMON */
+
 	list_del_init(&p->lru);
 	pool->cur_size--;
 
@@ -151,6 +169,50 @@ static void kbase_mem_pool_spill(struct kbase_mem_pool *next_pool,
 	kbase_mem_pool_add(next_pool, p);
 }
 
+#if IS_ENABLED(CONFIG_MALI_MTK_MEM_ALLOCATE_POLICY)
+static size_t g_guard = 0x1c0000000;
+static bool mtk_reclaim(struct kbase_mem_pool *pool)
+{
+	struct page *pp;
+	struct page *tmp;
+	struct kbase_device *const kbdev = pool->kbdev;
+	bool bRet;
+
+	bRet = false;
+
+	spin_lock(&kbdev->memdev.waste_list_lk);
+	if (kbdev->memdev.nr_waste_list == 0) {
+		spin_unlock(&kbdev->memdev.waste_list_lk);
+		return false;
+	}
+
+	list_for_each_entry_safe(pp, tmp, &kbdev->memdev.waste_list, lru) {
+		list_del_init(&pp->lru);
+		kbdev->memdev.nr_waste_list--;
+		bRet = true;
+		kbdev->mgm_dev->ops.mgm_free_page(kbdev->mgm_dev,
+			pool->group_id, pp, pool->order);
+	}
+
+	if (kbdev->memdev.nr_waste_list != 0) {
+		dev_vdbg(pool->kbdev->dev,
+			"Unexpected / Inconsist %d\n",
+			kbdev->memdev.nr_waste_list);
+        }
+	spin_unlock(&kbdev->memdev.waste_list_lk);
+
+	return bRet;
+}
+
+#define RANK1_0 (0)
+#define RANK1_80 (4)
+#define RANK1_85 (6)
+#define RANK1_90 (8)
+#define RANK1_95 (16)
+#define RANK1_99 (256)
+#define RANK1_100 (512)
+#endif
+
 struct page *kbase_mem_alloc_page(struct kbase_mem_pool *pool)
 {
 	struct page *p;
@@ -159,13 +221,78 @@ struct page *kbase_mem_alloc_page(struct kbase_mem_pool *pool)
 	struct device *const dev = kbdev->dev;
 	dma_addr_t dma_addr;
 	int i;
+#if IS_ENABLED(CONFIG_MALI_MTK_MEM_ALLOCATE_POLICY)
+	size_t waste_target;
+	size_t ratio;
+	bool enable_debug = false;
+	static int debug_count = 0;
+	static unsigned int retry;
+	struct page *pp;
+	struct page *tmp;
+
+	if (g_guard == 0x1c0000000) {
+		waste_target = (SZ_2G >> (PAGE_SHIFT));
+		retry = (SZ_2G >> (PAGE_SHIFT));
+	}
+	else {
+		waste_target = (SZ_2G >> (PAGE_SHIFT - 1));
+		retry = (SZ_2G >> (PAGE_SHIFT - 1));
+	}
+
+	ratio = RANK1_0;
+#endif
+
+
+#if IS_ENABLED(CONFIG_MALI_MTK_MEM_ALLOCATE_POLICY)
+#ifndef	__GFP_TAIL
+#define __GFP_TAIL (0x0)
+#endif
+    /* DDK allocate memory with rank1 */
+	if (kbdev->mem_allocate_policy != 0) {
+		gfp |= __GFP_TAIL;
+		ratio = kbdev->mem_allocate_policy;
+		if(kbdev->mem_allocate_policy & 0x1) {
+			enable_debug = true;
+			ratio--;
+		}
+	} else {
+		retry = waste_target;
+	}
+#endif /* CONFIG_MALI_MTK_MEM_ALLOCATE_POLICY */
 
 	/* don't warn on higher order failures */
 	if (pool->order)
 		gfp |= __GFP_NOWARN;
+#if IS_ENABLED(CONFIG_MALI_MTK_MEM_ALLOCATE_POLICY)
+    pp = NULL;
+    do {
+
+		if(pp) {
+			spin_lock(&kbdev->memdev.waste_list_lk);
+			list_add(&pp->lru, &kbdev->memdev.waste_list);
+			kbdev->memdev.nr_waste_list++;
+			if(kbdev->memdev.nr_waste_list == waste_target)
+				kbdev->memdev.bDisWA = true;
+			spin_unlock(&kbdev->memdev.waste_list_lk);
+
+			if(kbdev->memdev.bDisWA) {
+				mtk_reclaim(pool);
+			}
+		}
+#endif
 
 	p = kbdev->mgm_dev->ops.mgm_alloc_page(kbdev->mgm_dev,
 		pool->group_id, gfp, pool->order);
+#if IS_ENABLED(CONFIG_MALI_MTK_MEM_ALLOCATE_POLICY)
+		if (kbdev->memdev.bDisWA || (ratio < RANK1_100 &&
+			kbdev->memdev.nr_rank[1] / (kbdev->memdev.nr_rank[0] ? kbdev->memdev.nr_rank[0] : 1) >= ratio)) /* assure rank1 ratio*/
+			break;
+
+		pp = p;
+    } while(page_to_phys(p) <= g_guard && retry--);
+#endif
+
+
 	if (!p)
 		return NULL;
 
@@ -182,6 +309,25 @@ struct page *kbase_mem_alloc_page(struct kbase_mem_pool *pool)
 	for (i = 0; i < (1u << pool->order); i++)
 		kbase_set_dma_addr(p+i, dma_addr + PAGE_SIZE * i);
 
+#if IS_ENABLED(CONFIG_MALI_MTK_MEM_ALLOCATE_POLICY)
+	kbdev->memdev.ratio = ratio;
+	kbdev->memdev.waste_target = waste_target;
+
+	if(page_to_phys(p) > g_guard)
+		kbdev->memdev.nr_rank[1]++;
+	else
+		kbdev->memdev.nr_rank[0]++;
+
+	if(debug_count%16384 == 0 && enable_debug) {
+		debug_count = 0;
+		dev_vdbg(pool->kbdev->dev,
+			"[%u] r0: %llu r1: %llu waste: %llu --- [%u] %llu", ratio,
+			kbdev->memdev.nr_rank[0], kbdev->memdev.nr_rank[1],
+			kbdev->memdev.nr_waste_list, kbdev->memdev.bDisWA, g_guard);
+	}
+	debug_count++;
+#endif
+
 	return p;
 }
 
@@ -192,6 +338,13 @@ static void kbase_mem_pool_free_page(struct kbase_mem_pool *pool,
 	struct device *const dev = kbdev->dev;
 	dma_addr_t dma_addr = kbase_dma_addr(p);
 	int i;
+
+#if IS_ENABLED(CONFIG_MALI_MTK_MEM_ALLOCATE_POLICY)
+	if(page_to_phys(p) > g_guard)
+		kbdev->memdev.nr_rank[1]--;
+	else
+		kbdev->memdev.nr_rank[0]--;
+#endif
 
 	dma_unmap_page(dev, dma_addr, (PAGE_SIZE << pool->order),
 		       DMA_BIDIRECTIONAL);
@@ -325,6 +478,7 @@ static unsigned long kbase_mem_pool_reclaim_count_objects(struct shrinker *s,
 		kbase_mem_pool_unlock(pool);
 		return 0;
 	}
+
 	pool_size = kbase_mem_pool_size(pool);
 	kbase_mem_pool_unlock(pool);
 
@@ -338,6 +492,16 @@ static unsigned long kbase_mem_pool_reclaim_scan_objects(struct shrinker *s,
 	unsigned long freed;
 
 	pool = container_of(s, struct kbase_mem_pool, reclaim);
+
+#if IS_ENABLED(CONFIG_MALI_MTK_MEM_ALLOCATE_POLICY)
+	/* for releasing group 6 pool, use rank 0 waste list as victim 1st*/
+	if(pool->group_id == 6)  {
+		if(pool->next_pool == NULL) {
+			if (mtk_reclaim(pool))
+				return 0;
+		}
+	}
+#endif
 
 	kbase_mem_pool_lock(pool);
 	if (pool->dont_reclaim && !pool->dying) {
@@ -363,6 +527,9 @@ int kbase_mem_pool_init(struct kbase_mem_pool *pool,
 		struct kbase_device *kbdev,
 		struct kbase_mem_pool *next_pool)
 {
+#if IS_ENABLED(CONFIG_MALI_MTK_MEM_ALLOCATE_POLICY)
+	struct sysinfo info;
+#endif
 	if (WARN_ON(group_id < 0) ||
 		WARN_ON(group_id >= MEMORY_GROUP_MANAGER_NR_GROUPS)) {
 		return -EINVAL;
@@ -388,6 +555,13 @@ int kbase_mem_pool_init(struct kbase_mem_pool *pool,
 	pool->reclaim.batch = 0;
 	register_shrinker(&pool->reclaim);
 
+#if IS_ENABLED(CONFIG_MALI_MTK_MEM_ALLOCATE_POLICY)
+	si_meminfo(&info);
+	if(info.totalram < ((6*SZ_2G) >> (PAGE_SHIFT)))
+		g_guard = 0x1c0000000;
+	else
+		g_guard = 0x240000000;
+#endif
 	pool_dbg(pool, "initialized\n");
 
 	return 0;

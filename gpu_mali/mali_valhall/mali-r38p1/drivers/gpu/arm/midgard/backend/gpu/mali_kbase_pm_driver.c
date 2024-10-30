@@ -61,7 +61,7 @@
 
 #include <linux/of.h>
 
-#if IS_ENABLED(CONFIG_MALI_MTK_DEBUG) || IS_ENABLED(CONFIG_MALI_MTK_PROTECTED_PATCH)
+#if IS_ENABLED(CONFIG_MALI_MTK_DEBUG) || IS_ENABLED(CONFIG_MALI_MTK_PROTECTED_PATCH) || IS_ENABLED(CONFIG_MALI_MTK_ACP_DSU_REQ)
 #include <mtk_gpufreq.h>
 #include <platform/mtk_platform_common.h>
 #include <ged_dcs.h>
@@ -130,6 +130,9 @@ bool kbase_pm_is_mcu_desired(struct kbase_device *kbdev)
 
 	if (unlikely(!kbdev->csf.firmware_inited))
 		return false;
+
+	if (kbdev->csf.scheduler.under_pmode_process)
+		return true;
 
 	if (kbdev->csf.scheduler.pm_active_count &&
 	    kbdev->pm.backend.mcu_desired)
@@ -1240,6 +1243,9 @@ static int kbase_pm_l2_update_state(struct kbase_device *kbdev)
 					kbase_pm_invoke(kbdev, KBASE_PM_CORE_TILER, tiler_present,
 							ACTION_PWRON);
 				} else {
+#if IS_ENABLED(CONFIG_MALI_MTK_ACP_DSU_REQ)
+					mtk_platform_cpu_cache_request(kbdev, REQ_DSU_POWER_ON);
+#endif
 					kbase_pm_invoke(kbdev, KBASE_PM_CORE_L2, l2_present,
 							ACTION_PWRON);
 				}
@@ -1485,6 +1491,9 @@ static int kbase_pm_l2_update_state(struct kbase_device *kbdev)
 					 */
 					kbase_ipa_control_handle_gpu_sleep_enter(kbdev);
 #endif
+#if IS_ENABLED(CONFIG_MALI_MTK_ACP_DSU_REQ)
+					mtk_platform_cpu_cache_request(kbdev, REQ_DSU_POWER_OFF);
+#endif
 					/* L2 is now powered off */
 					backend->l2_state = KBASE_L2_OFF;
 				}
@@ -1495,6 +1504,9 @@ static int kbase_pm_l2_update_state(struct kbase_device *kbdev)
 					 * from being seen as active during sleep.
 					 */
 					kbase_ipa_control_handle_gpu_sleep_enter(kbdev);
+#endif
+#if IS_ENABLED(CONFIG_MALI_MTK_ACP_DSU_REQ)
+					mtk_platform_cpu_cache_request(kbdev, REQ_DSU_POWER_OFF);
 #endif
 					backend->l2_state = KBASE_L2_OFF;
 				}
@@ -2276,11 +2288,11 @@ void kbase_pm_reset_complete(struct kbase_device *kbdev)
 #define PM_TIMEOUT_MS (5000) /* 5s */
 #endif
 
-static void kbase_pm_timed_out(struct kbase_device *kbdev)
+static void kbase_pm_timed_out(struct kbase_device *kbdev, const char *timeout_msg)
 {
 	unsigned long flags;
 
-	dev_err(kbdev->dev, "Power transition timed out unexpectedly\n");
+	dev_err(kbdev->dev, "%s", timeout_msg);
 #if !MALI_USE_CSF
 	CSTD_UNUSED(flags);
 	dev_err(kbdev->dev, "Desired state :\n");
@@ -2421,7 +2433,7 @@ int kbase_pm_wait_for_l2_powered(struct kbase_device *kbdev)
 #endif
 
 	if (!remaining) {
-		kbase_pm_timed_out(kbdev);
+		kbase_pm_timed_out(kbdev, "Wait for desired PM state with L2 powered timed out");
 		err = -ETIMEDOUT;
 	} else if (remaining < 0) {
 		dev_info(
@@ -2451,7 +2463,7 @@ int kbase_pm_wait_for_desired_state(struct kbase_device *kbdev)
 
 	/* Wait for cores */
 #if KERNEL_VERSION(4, 13, 1) <= LINUX_VERSION_CODE
-	remaining = wait_event_killable_timeout(
+	remaining = wait_event_timeout(
 		kbdev->pm.backend.gpu_in_desired_state_wait,
 		kbase_pm_is_in_desired_state(kbdev), timeout);
 #else
@@ -2461,11 +2473,11 @@ int kbase_pm_wait_for_desired_state(struct kbase_device *kbdev)
 #endif
 
 	if (!remaining) {
-		kbase_pm_timed_out(kbdev);
+		kbase_pm_timed_out(kbdev, "Wait for power transition timed out");
 		err = -ETIMEDOUT;
 	} else if (remaining < 0) {
 		dev_info(kbdev->dev,
-			 "Wait for desired PM state got interrupted");
+			 "Wait for power transition got interrupted");
 		err = (int)remaining;
 	}
 
@@ -2520,7 +2532,7 @@ int kbase_pm_wait_for_cores_down_scale(struct kbase_device *kbdev)
 #endif
 
 	if (!remaining) {
-		kbase_pm_timed_out(kbdev);
+		kbase_pm_timed_out(kbdev, "Wait for cores down scaling timed out");
 		err = -ETIMEDOUT;
 	} else if (remaining < 0) {
 		dev_info(
@@ -2532,6 +2544,46 @@ int kbase_pm_wait_for_cores_down_scale(struct kbase_device *kbdev)
 	return err;
 }
 #endif
+
+static bool is_poweroff_wait_in_progress(struct kbase_device *kbdev)
+{
+	bool ret;
+	unsigned long flags;
+
+	spin_lock_irqsave(&kbdev->hwaccess_lock, flags);
+	ret = kbdev->pm.backend.poweroff_wait_in_progress;
+	spin_unlock_irqrestore(&kbdev->hwaccess_lock, flags);
+
+	return ret;
+}
+
+int kbase_pm_wait_for_poweroff_work_complete(struct kbase_device *kbdev)
+{
+	long remaining;
+#if MALI_USE_CSF
+	/* gpu_poweroff_wait_work would be subjected to the kernel scheduling
+	 * and so the wait time can't only be the function of GPU frequency.
+	 */
+	const unsigned int extra_wait_time_ms = 2000;
+	const long timeout =
+		kbase_csf_timeout_in_jiffies(kbase_get_timeout_ms(kbdev, CSF_PM_TIMEOUT) +
+					extra_wait_time_ms);
+#else
+	const long timeout = msecs_to_jiffies(PM_TIMEOUT_MS);
+#endif
+	int err = 0;
+
+	remaining = wait_event_timeout(
+		kbdev->pm.backend.poweroff_wait,
+		!is_poweroff_wait_in_progress(kbdev), timeout);
+	if (!remaining) {
+		kbase_pm_timed_out(kbdev, "Wait for poweroff work timed out");
+		err = -ETIMEDOUT;
+	}
+
+	return err;
+}
+KBASE_EXPORT_TEST_API(kbase_pm_wait_for_poweroff_work_complete);
 
 void kbase_pm_enable_interrupts(struct kbase_device *kbdev)
 {
@@ -3118,6 +3170,10 @@ static int kbase_pm_do_reset(struct kbase_device *kbdev)
 
 	KBASE_TLSTREAM_JD_GPU_SOFT_RESET(kbdev, kbdev);
 
+#if IS_ENABLED(CONFIG_MALI_MTK_ACP_DSU_REQ)
+	mtk_platform_cpu_cache_request(kbdev, REQ_DSU_POWER_ON);
+#endif
+
 	if (kbdev->pm.backend.callback_soft_reset) {
 		ret = kbdev->pm.backend.callback_soft_reset(kbdev);
 		if (ret < 0)
@@ -3146,17 +3202,31 @@ static int kbase_pm_do_reset(struct kbase_device *kbdev)
 	/* Wait for the RESET_COMPLETED interrupt to be raised */
 	kbase_pm_wait_for_reset(kbdev);
 
+#if IS_ENABLED(CONFIG_MALI_MTK_TIMEOUT_RESET)
+	if (!kbdev->reset_force_hard_reset) {
+#endif /* CONFIG_MALI_MTK_TIMEOUT_RESET */
 	if (!rtdata.timed_out) {
 		/* GPU has been reset */
 		hrtimer_cancel(&rtdata.timer);
 		destroy_hrtimer_on_stack(&rtdata.timer);
+		dev_info(kbdev->dev, "GPU soft reset completed");
 #if IS_ENABLED(CONFIG_MALI_MTK_LOG_BUFFER)
-		mtk_logbuffer_print(&kbdev->logbuf_exception,
+		mtk_logbuffer_type_print(kbdev, MTK_LOGBUFFER_TYPE_ALL,
 			"[%llxt] GPU soft reset completed\n",
 			mtk_logbuffer_get_timestamp(kbdev, &kbdev->logbuf_exception));
 #endif /* CONFIG_MALI_MTK_LOG_BUFFER */
 		return 0;
 	}
+#if IS_ENABLED(CONFIG_MALI_MTK_TIMEOUT_RESET)
+	} else {
+		dev_info(kbdev->dev, "No need to check if GPU soft reset was timed-out");
+#if IS_ENABLED(CONFIG_MALI_MTK_LOG_BUFFER)
+		mtk_logbuffer_print(&kbdev->logbuf_exception,
+			"[%llxt] No need to check if GPU soft reset was timed-out\n",
+			mtk_logbuffer_get_timestamp(kbdev, &kbdev->logbuf_exception));
+#endif /* CONFIG_MALI_MTK_LOG_BUFFER */
+	}
+#endif /* CONFIG_MALI_MTK_TIMEOUT_RESET */
 
 	/* No interrupt has been received - check if the RAWSTAT register says
 	 * the reset has completed
@@ -3228,10 +3298,17 @@ static int kbase_pm_do_reset(struct kbase_device *kbdev)
 		/* Wait for the RESET_COMPLETED interrupt to be raised */
 		kbase_pm_wait_for_reset(kbdev);
 
+#if IS_ENABLED(CONFIG_MALI_MTK_TIMEOUT_RESET)
+		spin_lock(&kbdev->reset_force_change);
+		kbdev->reset_force_hard_reset = false;
+		spin_unlock(&kbdev->reset_force_change);
+#endif /* CONFIG_MALI_MTK_TIMEOUT_RESET */
+
 		if (!rtdata.timed_out) {
 			/* GPU has been reset */
 			hrtimer_cancel(&rtdata.timer);
 			destroy_hrtimer_on_stack(&rtdata.timer);
+			dev_info(kbdev->dev, "GPU hard reset completed");
 #if IS_ENABLED(CONFIG_MALI_MTK_LOG_BUFFER)
 			mtk_logbuffer_print(&kbdev->logbuf_exception,
 				"[%llxt] GPU hard reset completed\n",
@@ -3566,6 +3643,8 @@ int kbase_pm_apply_pmode_entry_wa(struct kbase_device *kbdev)
 
 	spin_lock_irqsave(&kbdev->hwaccess_lock, flags);
 
+	kbdev->csf.scheduler.under_pmode_process = true;
+
 	WARN_ON(!kbdev->pm.backend.gpu_powered);
 
 	if (!kbase_pm_no_mcu_core_pwroff(kbdev)) {
@@ -3626,6 +3705,9 @@ void kbase_pm_apply_pmode_exit_wa(struct kbase_device *kbdev)
 		 */
 		kbase_pm_update_state(kbdev);
 	}
+
+	kbdev->csf.scheduler.under_pmode_process = false;
+
 	spin_unlock_irqrestore(&kbdev->hwaccess_lock, flags);
 
 #if IS_ENABLED(CONFIG_MALI_MTK_PROTECTED_PATCH)

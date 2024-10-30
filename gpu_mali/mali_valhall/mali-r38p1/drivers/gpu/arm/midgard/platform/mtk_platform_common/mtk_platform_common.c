@@ -10,6 +10,8 @@
 #include <platform/mtk_platform_common.h>
 #include <mtk_gpufreq.h>
 #include <ged_dvfs.h>
+#include <ged_base.h>
+#include <ged_type.h>
 
 #if IS_ENABLED(CONFIG_MALI_MIDGARD_DVFS) && IS_ENABLED(CONFIG_MALI_MTK_DVFS_POLICY)
 #include <platform/mtk_platform_common/mtk_platform_dvfs.h>
@@ -51,11 +53,23 @@
 #if IS_ENABLED(CONFIG_MTK_GPU_SWPM_SUPPORT)
 #include <mtk_gpu_power_sspm_ipi.h>
 #include <platform/mtk_mfg_counter.h>
-#endif
+#endif /* CONFIG_MTK_GPU_SWPM_SUPPORT */
+
+#if IS_ENABLED(CONFIG_MALI_MTK_RECLAIM_POLICY)
+#include <mtk_platform_reclaim_policy.h>
+#endif /* CONFIG_MALI_MTK_RECLAIM_POLICY */
+
+#if IS_ENABLED(CONFIG_MALI_MTK_MEM_ALLOCATE_POLICY)
+#include <mtk_platform_mem_allocate_policy.h>
+#endif /* CONFIG_MALI_MTK_MEM_ALLOCATE_POLICY */
 
 #if IS_ENABLED(CONFIG_MALI_MTK_IRQ_TRACE)
 #include <platform/mtk_platform_common/mtk_platform_irq_trace.h>
 #endif /* CONFIG_MALI_MTK_IRQ_TRACE */
+
+#if IS_ENABLED(CONFIG_MALI_MTK_PENDING_SUBMISSION_MODE)
+#include <platform/mtk_platform_common/mtk_platform_pending_submission.h>
+#endif /* CONFIG_MALI_MTK_PENDING_SUBMISSION_MODE */
 
 #include "csf/mali_kbase_csf_trace_buffer.h"
 
@@ -141,6 +155,14 @@ void mtk_common_debug(enum mtk_common_debug_types type, int pid, u64 hook_point)
 		if (!mtk_common_gpufreq_bringup() && kbdev->pm.backend.gpu_powered) {
 #if defined(CONFIG_MTK_GPUFREQ_V2)
 			gpufreq_dump_infra_status();
+
+#if IS_ENABLED(CONFIG_MALI_MTK_LOG_BUFFER)
+			mtk_logbuffer_print(&kbdev->logbuf_exception,
+				"[gpu_greq] GPU: cur_volt=%u cur_greq=%u, STACK: cur_volt=%u cur_greq=%u\n",
+				gpufreq_get_cur_volt(TARGET_GPU), gpufreq_get_cur_freq(TARGET_GPU),
+				gpufreq_get_cur_volt(TARGET_STACK), gpufreq_get_cur_freq(TARGET_STACK));
+#endif /* CONFIG_MALI_MTK_LOG_BUFFER */
+
 #else
 			mt_gpufreq_dump_infra_status();
 #endif /* CONFIG_MTK_GPUFREQ_V2 */
@@ -159,6 +181,7 @@ void mtk_common_debug(enum mtk_common_debug_types type, int pid, u64 hook_point)
 	case MTK_COMMON_DBG_DUMP_FULL_DB:
 #if IS_ENABLED(CONFIG_MALI_MTK_DIAGNOSIS_MODE)
 		dev_info(kbdev->dev, "trigger gpu full DB dump");
+#if IS_ENABLED(CONFIG_MALI_CSF_SUPPORT)
 #if IS_ENABLED(CONFIG_MALI_MTK_FENCE_DEBUG)
 		if (!(diagnosis_dump_mask & MTK_DBG_COMMON_DUMP_SKIP_GROUPS_QUEUES)) {
 			mtk_debug_csf_dump_groups_and_queues(kbdev, pid);
@@ -169,6 +192,7 @@ void mtk_common_debug(enum mtk_common_debug_types type, int pid, u64 hook_point)
 			mtk_kbase_csf_firmware_ke_dump_fwlog(kbdev); /* dump fwlog, reserve 16k for fwlog*/
 		}
 #endif /* CONFIG_MALI_MTK_KE_DUMP_FWLOG */
+#endif /* CONFIG_MALI_CSF_SUPPORT */
 #if IS_ENABLED(CONFIG_MALI_MTK_CM7_TRACE)
 #if IS_ENABLED(CONFIG_MTK_GPU_DIAGNOSIS_DEBUG)
 		disable_etb_capture(); /* stop ETB capture before DFD trig */
@@ -239,6 +263,24 @@ int mtk_common_ged_dvfs_get_last_commit_idx(void)
 {
 #if IS_ENABLED(CONFIG_MALI_MIDGARD_DVFS) && IS_ENABLED(CONFIG_MALI_MTK_DVFS_POLICY)
 	return (int)ged_dvfs_get_last_commit_idx();
+#else
+	return -1;
+#endif
+}
+
+unsigned long mtk_common_ged_dvfs_write_sysram_last_commit_idx(void)
+{
+#if IS_ENABLED(CONFIG_MALI_MIDGARD_DVFS) && IS_ENABLED(CONFIG_MALI_MTK_DVFS_POLICY)
+	return (unsigned long)ged_dvfs_write_sysram_last_commit_idx();
+#else
+	return -1;
+#endif
+}
+
+unsigned long mtk_common_ged_dvfs_write_sysram_last_commit_idx_test(int commit_idx)
+{
+#if IS_ENABLED(CONFIG_MALI_MIDGARD_DVFS) && IS_ENABLED(CONFIG_MALI_MTK_DVFS_POLICY)
+	return (unsigned long)ged_dvfs_write_sysram_last_commit_idx_test(commit_idx);
 #else
 	return -1;
 #endif
@@ -327,15 +369,21 @@ static int mtk_debug_sleep_mode(struct seq_file *file, void *data)
 	struct kbase_device *kbdev = file->private;
 	struct device_node *np;
 	u32 sleep_mode_enable = 0;
+	bool sleep_mode_policy = false;
+	u32 segment_id = 0;
 
 	if (IS_ERR_OR_NULL(kbdev))
 		return -1;
 
+	segment_id = ged_get_segment_id();
 	np = kbdev->dev->of_node;
 
-	if (!of_property_read_u32(np, "sleep-mode-enable", &sleep_mode_enable))
-		seq_printf(file, "Sleep mode: %s\n", (sleep_mode_enable) ? "enabled": "disabled");
-	else
+	if (!of_property_read_u32(np, "sleep-mode-enable", &sleep_mode_enable)) {
+		sleep_mode_policy = (sleep_mode_enable == 1) ||
+		((sleep_mode_enable == 0xFF) && (segment_id == MT6985W_TCZA_SEGMENT));
+		seq_printf(file, "Sleep mode enable: %s\n", (sleep_mode_enable == 1) ? "enabled": "disabled");
+		seq_printf(file, "Sleep mode policy: %s\n", (sleep_mode_policy == true) ? "enabled": "disabled");
+	} else
 		seq_printf(file, "Sleep mode: No dts property setting, default disabled\n");
 
 	return 0;
@@ -372,6 +420,9 @@ void mtk_common_debugfs_init(struct kbase_device *kbdev)
 		return;
 
 	mtk_debug_sleep_mode_debugfs_init(kbdev);
+#if IS_ENABLED(CONFIG_MALI_MTK_PENDING_SUBMISSION_MODE)
+	mtk_debug_pending_submission_mode_debugfs_init(kbdev);
+#endif /* CONFIG_MALI_MTK_PENDING_SUBMISSION_MODE */
 #if IS_ENABLED(CONFIG_MALI_MTK_IRQ_TRACE)
 	mtk_debug_irq_trace_debugfs_init(kbdev);
 #endif /* CONFIG_MALI_MTK_IRQ_TRACE */
@@ -437,6 +488,17 @@ int mtk_common_device_init(struct kbase_device *kbdev)
 	mtk_mfg_counter_init();
 #endif
 
+#if IS_ENABLED(CONFIG_MALI_MTK_TIMEOUT_RESET)
+	spin_lock_init(&kbdev->reset_force_change);
+#endif /* CONFIG_MALI_MTK_TIMEOUT_RESET */
+#if IS_ENABLED(CONFIG_MALI_MTK_RECLAIM_POLICY)
+	MTKGPU_reclaim_policy_init(kbdev);
+#endif /* CONFIG_MALI_MTK_RECLAIM_POLICY */
+
+#if IS_ENABLED(CONFIG_MALI_MTK_MEM_ALLOCATE_POLICY)
+	MTKGPU_mem_allocate_policy_init(kbdev);
+#endif /* CONFIG_MALI_MTK_MEM_ALLOCATE_POLICY */
+
 	return 0;
 }
 
@@ -479,6 +541,14 @@ void mtk_common_device_term(struct kbase_device *kbdev)
 	MTKGPUPower_model_destroy();
 	mtk_mfg_counter_destroy();
 #endif
+
+#if IS_ENABLED(CONFIG_MALI_MTK_RECLAIM_POLICY)
+	MTKGPU_reclaim_policy_destroy(kbdev);
+#endif /* CONFIG_MALI_MTK_RECLAIM_POLICY */
+
+#if IS_ENABLED(CONFIG_MALI_MTK_MEM_ALLOCATE_POLICY)
+	MTKGPU_mem_allocate_policy_destroy(kbdev);
+#endif /* CONFIG_MALI_MTK_MEM_ALLOCATE_POLICY */
 
 	mtk_platform_pm_term(kbdev);
 }

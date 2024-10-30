@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note
 /*
  *
- * (C) COPYRIGHT 2019-2022 ARM Limited. All rights reserved.
+ * (C) COPYRIGHT 2019-2023 ARM Limited. All rights reserved.
  *
  * This program is free software and is provided to you under the terms of the
  * GNU General Public License version 2 as published by the Free Software
@@ -282,14 +282,18 @@ void kbase_mmu_report_fault_and_kill(struct kbase_context *kctx,
 		"exception type 0x%X: %s\n"
 		"access type 0x%X: %s\n"
 		"source id 0x%X\n"
-		"pid: %d\n",
+		"pid: %d\n"
+		"Ctx %d_%d\n",
 		as_no, fault->addr,
 		reason_str,
 		status,
 		exception_type, kbase_gpu_exception_name(exception_type),
 		access_type, kbase_gpu_access_type_name(status),
 		source_id,
-		kctx->pid);
+		kctx->pid,
+		kctx->tgid, kctx->id);
+
+	kctx->has_page_faults = true;
 
 #if IS_ENABLED(CONFIG_MALI_MTK_LOG_BUFFER)
 	mtk_logbuffer_print(&kbdev->logbuf_exception,
@@ -299,7 +303,8 @@ void kbase_mmu_report_fault_and_kill(struct kbase_context *kctx,
 		"exception type 0x%X: %s\n"
 		"access type 0x%X: %s\n"
 		"source id 0x%X\n"
-		"pid: %d\n",
+		"pid: %d\n"
+		"Ctx %d_%d\n",
 		mtk_logbuffer_get_timestamp(kbdev, &kbdev->logbuf_exception),
 		as_no, fault->addr,
 		reason_str,
@@ -307,7 +312,8 @@ void kbase_mmu_report_fault_and_kill(struct kbase_context *kctx,
 		exception_type, kbase_gpu_exception_name(exception_type),
 		access_type, kbase_gpu_access_type_name(status),
 		source_id,
-		kctx->pid);
+		kctx->pid,
+		kctx->tgid, kctx->id);
 #endif /* CONFIG_MALI_MTK_LOG_BUFFER */
 
 #if IS_ENABLED(CONFIG_MALI_MTK_DEBUG)
@@ -632,6 +638,7 @@ int kbase_mmu_as_init(struct kbase_device *kbdev, int i)
 	kbdev->as[i].bf_data.addr = 0ULL;
 	kbdev->as[i].pf_data.addr = 0ULL;
 	kbdev->as[i].gf_data.addr = 0ULL;
+	kbdev->as[i].is_unresponsive = false;
 
 	kbdev->as[i].pf_wq = alloc_workqueue("mali_mmu%d", 0, 1, i);
 	if (!kbdev->as[i].pf_wq)

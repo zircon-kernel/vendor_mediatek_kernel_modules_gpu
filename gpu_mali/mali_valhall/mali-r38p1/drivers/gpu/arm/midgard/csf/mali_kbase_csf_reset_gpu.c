@@ -264,6 +264,36 @@ static void kbase_csf_debug_dump_registers(struct kbase_device *kbdev)
 		kbase_reg_read(kbdev, GPU_CONTROL_REG(SHADER_CONFIG)),
 		kbase_reg_read(kbdev, GPU_CONTROL_REG(L2_MMU_CONFIG)),
 		kbase_reg_read(kbdev, GPU_CONTROL_REG(TILER_CONFIG)));
+
+#if IS_ENABLED(CONFIG_MALI_MTK_LOG_BUFFER)
+	mtk_logbuffer_print(&kbdev->logbuf_exception,
+		"[%llxt] Register state:\n",
+		mtk_logbuffer_get_timestamp(kbdev, &kbdev->logbuf_exception));
+	mtk_logbuffer_print(&kbdev->logbuf_exception,
+		"  GPU_IRQ_RAWSTAT=0x%08x   GPU_STATUS=0x%08x  MCU_STATUS=0x%08x\n",
+		kbase_reg_read(kbdev, GPU_CONTROL_REG(GPU_IRQ_RAWSTAT)),
+		kbase_reg_read(kbdev, GPU_CONTROL_REG(GPU_STATUS)),
+		kbase_reg_read(kbdev, GPU_CONTROL_REG(MCU_STATUS)));
+	mtk_logbuffer_print(&kbdev->logbuf_exception,
+		"  JOB_IRQ_RAWSTAT=0x%08x   MMU_IRQ_RAWSTAT=0x%08x   GPU_FAULTSTATUS=0x%08x\n",
+		kbase_reg_read(kbdev, JOB_CONTROL_REG(JOB_IRQ_RAWSTAT)),
+		kbase_reg_read(kbdev, MMU_REG(MMU_IRQ_RAWSTAT)),
+		kbase_reg_read(kbdev, GPU_CONTROL_REG(GPU_FAULTSTATUS)));
+	mtk_logbuffer_print(&kbdev->logbuf_exception,
+		"  GPU_IRQ_MASK=0x%08x   JOB_IRQ_MASK=0x%08x   MMU_IRQ_MASK=0x%08x\n",
+		kbase_reg_read(kbdev, GPU_CONTROL_REG(GPU_IRQ_MASK)),
+		kbase_reg_read(kbdev, JOB_CONTROL_REG(JOB_IRQ_MASK)),
+		kbase_reg_read(kbdev, MMU_REG(MMU_IRQ_MASK)));
+	mtk_logbuffer_print(&kbdev->logbuf_exception,
+		"  PWR_OVERRIDE0=0x%08x   PWR_OVERRIDE1=0x%08x\n",
+		kbase_reg_read(kbdev, GPU_CONTROL_REG(PWR_OVERRIDE0)),
+		kbase_reg_read(kbdev, GPU_CONTROL_REG(PWR_OVERRIDE1)));
+	mtk_logbuffer_print(&kbdev->logbuf_exception,
+		"  SHADER_CONFIG=0x%08x   L2_MMU_CONFIG=0x%08x   TILER_CONFIG=0x%08x\n",
+		kbase_reg_read(kbdev, GPU_CONTROL_REG(SHADER_CONFIG)),
+		kbase_reg_read(kbdev, GPU_CONTROL_REG(L2_MMU_CONFIG)),
+		kbase_reg_read(kbdev, GPU_CONTROL_REG(TILER_CONFIG)));
+#endif /* CONFIG_MALI_MTK_LOG_BUFFER */
 }
 
 /**
@@ -461,7 +491,7 @@ static int kbase_csf_reset_gpu_now(struct kbase_device *kbdev, bool firmware_ini
 	if (!silent) {
 		dev_err(kbdev->dev, "Reset complete");
 #if IS_ENABLED(CONFIG_MALI_MTK_LOG_BUFFER)
-		mtk_logbuffer_print(&kbdev->logbuf_exception,
+		mtk_logbuffer_type_print(kbdev, MTK_LOGBUFFER_TYPE_ALL,
 			"[%llxt] Reset complete\n",
 			mtk_logbuffer_get_timestamp(kbdev, &kbdev->logbuf_exception));
 #endif /* CONFIG_MALI_MTK_LOG_BUFFER */
@@ -520,7 +550,6 @@ static void kbase_csf_reset_gpu_worker(struct work_struct *data)
 		err = kbase_csf_reset_gpu_now(kbdev, firmware_inited, silent);
 		kbase_pm_context_idle(kbdev);
 	}
-
 	kbase_disjoint_state_down(kbdev);
 
 	/* Allow other threads to once again use the GPU */
@@ -565,7 +594,7 @@ void kbase_reset_gpu(struct kbase_device *kbdev)
 	dev_err(kbdev->dev, "Preparing to soft-reset GPU\n");
 
 #if IS_ENABLED(CONFIG_MALI_MTK_LOG_BUFFER)
-	mtk_logbuffer_print(&kbdev->logbuf_exception,
+	mtk_logbuffer_type_print(kbdev, MTK_LOGBUFFER_TYPE_ALL,
 		"[%llxt] Preparing to soft-reset GPU\n",
 		mtk_logbuffer_get_timestamp(kbdev, &kbdev->logbuf_exception));
 #endif /* CONFIG_MALI_MTK_LOG_BUFFER */

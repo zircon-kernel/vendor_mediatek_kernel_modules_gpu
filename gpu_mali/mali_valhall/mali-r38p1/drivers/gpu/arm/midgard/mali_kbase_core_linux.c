@@ -122,13 +122,23 @@
 
 #include <mali_kbase_caps.h>
 
-#if IS_ENABLED(CONFIG_MALI_MTK_FENCE_DEBUG) || IS_ENABLED(CONFIG_MALI_MTK_ACP_DSU_REQ)
+#if IS_ENABLED(CONFIG_MALI_MTK_FENCE_DEBUG)
 #include <platform/mtk_platform_common.h>
 #endif /* CONFIG_MALI_MTK_FENCE_DEBUG */
 
 #if IS_ENABLED(CONFIG_MALI_MTK_LOG_BUFFER)
 #include <platform/mtk_platform_common/mtk_platform_logbuffer.h>
 #endif /* CONFIG_MALI_MTK_LOG_BUFFER */
+
+#if defined(CONFIG_MALI_MTK_GPU_BM_JM)
+#include <gpu_bm.h>
+#if IS_ENABLED(CONFIG_MTK_TINYSYS_SSPM_SUPPORT)
+#include <sspm_reservedmem_define.h>
+static phys_addr_t rec_phys_addr, rec_virt_addr;
+static unsigned long long rec_size;
+struct v1_data *gpu_info_ref;
+#endif /* CONFIG_MTK_TINYSYS_SSPM_SUPPORT */
+#endif /* CONFIG_MALI_MTK_GPU_BM_JM */
 
 #if defined(CONFIG_MALI_MTK_GPU_BM_CSF)
 #include <ged_gpu_bm.h>
@@ -188,6 +198,49 @@ static const struct mali_kbase_capability_def kbase_caps_table[MALI_KBASE_NUM_CA
 /* Mutex to synchronize the probe of multiple kbase instances */
 static struct mutex kbase_probe_mutex;
 #endif
+
+#if defined(CONFIG_MALI_MTK_GPU_BM_JM)
+static void get_rec_addr(void)
+{
+	int i;
+	unsigned char *ptr;
+
+	pr_info("%s: [GPU_QOS] start to get sspm reserved memory\n", __func__);
+	/* get sspm reserved mem */
+	rec_phys_addr = sspm_reserve_mem_get_phys(GPU_MEM_ID);
+	rec_virt_addr = sspm_reserve_mem_get_virt(GPU_MEM_ID);
+	rec_size = sspm_reserve_mem_get_size(GPU_MEM_ID);
+
+	/* clear */
+	ptr = (unsigned char *)(uintptr_t)rec_virt_addr;
+	for (i = 0; i < rec_size; i++)
+		ptr[i] = 0x0;
+
+	gpu_info_ref = (struct v1_data *)(uintptr_t)rec_virt_addr;
+}
+
+static int mtk_bandwith_resource_init(struct kbase_device *kbdev)
+{
+	int err = 0;
+
+	pr_info("%s: [GPU_QOS] try to get rec addr\n", __func__);
+
+#if IS_ENABLED(CONFIG_MTK_TINYSYS_SSPM_SUPPORT)
+	get_rec_addr();
+
+	if(gpu_info_ref == NULL) {
+		err = -1;
+		pr_info("%s: [GPU_QOS] get sspm reserved memory fail\n", __func__);
+		return err;
+	}
+	kbdev->v1 = gpu_info_ref;
+	kbdev->v1->version = 1;
+	kbdev->job_status_addr.phyaddr = rec_phys_addr;
+	MTKGPUQoS_setup(kbdev->v1, kbdev->job_status_addr.phyaddr, rec_size);
+#endif /* CONFIG_MTK_TINYSYS_SSPM_SUPPORT */
+	return err;
+}
+#endif /* CONFIG_MALI_MTK_GPU_BM_JM */
 
 /**
  * mali_kbase_supports_cap - Query whether a kbase capability is supported
@@ -1507,6 +1560,9 @@ static int kbasep_kcpu_queue_enqueue(struct kbase_context *kctx,
 static int kbasep_cs_tiler_heap_init(struct kbase_context *kctx,
 		union kbase_ioctl_cs_tiler_heap_init *heap_init)
 {
+	if (heap_init->in.group_id >= MEMORY_GROUP_MANAGER_NR_GROUPS)
+		return -EINVAL;
+
 	kctx->jit_group_id = heap_init->in.group_id;
 
 	return kbase_csf_tiler_heap_init(kctx, heap_init->in.chunk_size,
@@ -1519,6 +1575,9 @@ static int kbasep_cs_tiler_heap_init(struct kbase_context *kctx,
 static int kbasep_cs_tiler_heap_init_1_13(struct kbase_context *kctx,
 					  union kbase_ioctl_cs_tiler_heap_init_1_13 *heap_init)
 {
+	if (heap_init->in.group_id >= MEMORY_GROUP_MANAGER_NR_GROUPS)
+		return -EINVAL;
+
 	kctx->jit_group_id = heap_init->in.group_id;
 
 	return kbase_csf_tiler_heap_init(kctx, heap_init->in.chunk_size,
@@ -1731,14 +1790,14 @@ static int kbasep_ioctl_set_limited_core_count(struct kbase_context *kctx,
 static int kbasep_ioctl_internal_fence_wait(struct kbase_context *kctx,
 			struct kbase_ioctl_internal_fence_wait *fence_wait)
 {
-	dev_info(kctx->kbdev->dev, "internal fence wait timeouts(%llu ms)! flags=0x%x pid=%u",
+	dev_info(kctx->kbdev->dev, "Internal fence wait timeouts(%llu ms)! flags=0x%x pid=%u",
 	         fence_wait->time_in_microseconds,
 	         fence_wait->flags,
 	         fence_wait->pid);
 
 #if IS_ENABLED(CONFIG_MALI_MTK_LOG_BUFFER)
-	mtk_logbuffer_print(&kctx->kbdev->logbuf_exception,
-		"[%llxt] internal fence wait timeouts(%llu ms)! flags=0x%x pid=%u\n",
+	mtk_logbuffer_type_print(kctx->kbdev, MTK_LOGBUFFER_TYPE_ALL,
+		"[%llxt] Internal fence wait timeouts(%llu ms)! flags=0x%x pid=%u\n",
 		mtk_logbuffer_get_timestamp(kctx->kbdev, &kctx->kbdev->logbuf_exception),
 		fence_wait->time_in_microseconds,
 		fence_wait->flags,
@@ -1763,21 +1822,34 @@ static int kbasep_ioctl_internal_fence_wait(struct kbase_context *kctx,
 	}
 #endif
 
-#if IS_ENABLED(CONFIG_MALI_MTK_FENCE_TIMEOUT_RESET)
-	if (fence_wait->time_in_microseconds > 3000)
-		if (kctx->kbdev->pm.backend.gpu_powered)
-			if (kbase_prepare_to_reset_gpu(kctx->kbdev, RESET_FLAGS_NONE))
-			{
-				dev_info(kctx->kbdev->dev, "internal fence timeouts(%llu ms)! reset gpu",
-						 fence_wait->time_in_microseconds);
-#if IS_ENABLED(CONFIG_MALI_MTK_LOG_BUFFER)
-				mtk_logbuffer_print(&kctx->kbdev->logbuf_exception,
-						 "internal fence timeouts(%llu ms)! reset gpu\n", fence_wait->time_in_microseconds);
+#if IS_ENABLED(CONFIG_MALI_MTK_TIMEOUT_RESET)
+	if (fence_wait->time_in_microseconds > 3000) {
+		spin_lock(&kctx->kbdev->reset_force_change);
+		kctx->kbdev->reset_force_evict_group_work = true;
+		spin_unlock(&kctx->kbdev->reset_force_change);
 
+		if (kbase_prepare_to_reset_gpu(kctx->kbdev, RESET_FLAGS_NONE)) {
+			dev_info(kctx->kbdev->dev, "Internal fence timeouts(%llu ms)! Trigger GPU reset",
+					 fence_wait->time_in_microseconds);
+#if IS_ENABLED(CONFIG_MALI_MTK_LOG_BUFFER)
+				mtk_logbuffer_type_print(kctx->kbdev, MTK_LOGBUFFER_TYPE_ALL,
+					"[%llxt] Internal fence timeouts(%llu ms)! Trigger GPU reset\n",
+					mtk_logbuffer_get_timestamp(kctx->kbdev, &kctx->kbdev->logbuf_exception),
+					fence_wait->time_in_microseconds);
 #endif /* CONFIG_MALI_MTK_LOG_BUFFER */
-				kbase_reset_gpu(kctx->kbdev);
-			}
-#endif /* CONFIG_MALI_MTK_FENCE_TIMEOUT_RESET */
+			kbase_reset_gpu(kctx->kbdev);
+		} else {
+			dev_info(kctx->kbdev->dev, "Internal fence timeouts(%llu ms)! Other threads are already resetting the GPU",
+					 fence_wait->time_in_microseconds);
+#if IS_ENABLED(CONFIG_MALI_MTK_LOG_BUFFER)
+				mtk_logbuffer_type_print(kctx->kbdev, MTK_LOGBUFFER_TYPE_ALL,
+					"[%llxt] Internal fence timeouts(%llu ms)! Other threads are already resetting the GPU\n",
+					mtk_logbuffer_get_timestamp(kctx->kbdev, &kctx->kbdev->logbuf_exception),
+					fence_wait->time_in_microseconds);
+#endif /* CONFIG_MALI_MTK_LOG_BUFFER */
+		}
+	}
+#endif /* CONFIG_MALI_MTK_TIMEOUT_RESET */
 
 	return 0;
 }
@@ -5688,6 +5760,13 @@ static int kbase_platform_device_probe(struct platform_device *pdev)
 		mutex_unlock(&kbase_probe_mutex);
 #endif
 	} else {
+
+#if defined(CONFIG_MALI_MTK_GPU_BM_JM)
+		err = mtk_bandwith_resource_init(kbdev);
+		if (err)
+			pr_info("@%s: GPU BM init failed (JM)\n", __func__);
+#endif /* CONFIG_MALI_MTK_GPU_BM_JM */
+
 #if defined(CONFIG_MALI_MTK_GPU_BM_CSF)
 		err = mtk_bandwidth_resource_init();
 		if (err)
@@ -5823,13 +5902,7 @@ static int kbase_device_runtime_suspend(struct device *dev)
 	KBASE_KTRACE_ADD(kbdev, PM_RUNTIME_SUSPEND_CALLBACK, NULL, 0);
 
 #if MALI_USE_CSF
-#if IS_ENABLED(CONFIG_MALI_MTK_ACP_DSU_REQ)
-	mtk_platform_cpu_cache_request(kbdev, REQ_DSU_POWER_ON);
-#endif
 	ret = kbase_pm_handle_runtime_suspend(kbdev);
-#if IS_ENABLED(CONFIG_MALI_MTK_ACP_DSU_REQ)
-	mtk_platform_cpu_cache_request(kbdev, REQ_DSU_POWER_OFF);
-#endif
 	if (ret)
 		return ret;
 #endif

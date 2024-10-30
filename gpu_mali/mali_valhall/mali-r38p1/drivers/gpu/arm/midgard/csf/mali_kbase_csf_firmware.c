@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note
 /*
  *
- * (C) COPYRIGHT 2018-2022 ARM Limited. All rights reserved.
+ * (C) COPYRIGHT 2018-2023 ARM Limited. All rights reserved.
  *
  * This program is free software and is provided to you under the terms of the
  * GNU General Public License version 2 as published by the Free Software
@@ -52,6 +52,8 @@
 #include <mmu/mali_kbase_mmu.h>
 #include <asm/arch_timer.h>
 #include <linux/delay.h>
+#include <ged_base.h>
+#include <ged_type.h>
 
 #if IS_ENABLED(CONFIG_MALI_MTK_DEBUG)
 #include "platform/mtk_platform_common.h"
@@ -300,33 +302,52 @@ static void boot_csf_firmware(struct kbase_device *kbdev)
 	wait_for_firmware_boot(kbdev);
 }
 
-static void wait_ready(struct kbase_device *kbdev)
+/**
+ * wait_ready() - Wait for previously issued MMU command to complete.
+ *
+ * @kbdev:        Kbase device to wait for a MMU command to complete.
+ *
+ * Reset GPU if the wait for previously issued command times out.
+ *
+ * Return:  0 on success, error code otherwise.
+ */
+static int wait_ready(struct kbase_device *kbdev)
 {
-	u32 max_loops = KBASE_AS_INACTIVE_MAX_LOOPS;
-	u32 val;
+	const ktime_t wait_loop_start = ktime_get_raw();
+	const u32 mmu_as_inactive_wait_time_ms = kbdev->mmu_as_inactive_wait_time_ms;
+	s64 diff;
+ 
+	do {
+		unsigned int i;
+ 
+		for (i = 0; i < 1000; i++) {
+			/* Wait for the MMU status to indicate there is no active command */
+			if (!(kbase_reg_read(kbdev, MMU_AS_REG(MCU_AS_NR, AS_STATUS)) &
+			      AS_STATUS_AS_ACTIVE))
+				return 0;
+		}
+ 
+		diff = ktime_to_ms(ktime_sub(ktime_get_raw(), wait_loop_start));
+	} while (diff < mmu_as_inactive_wait_time_ms);
 
-	val = kbase_reg_read(kbdev, MMU_AS_REG(MCU_AS_NR, AS_STATUS));
-
-	/* Wait for a while for the update command to take effect */
-	while (--max_loops && (val & AS_STATUS_AS_ACTIVE))
-		val = kbase_reg_read(kbdev, MMU_AS_REG(MCU_AS_NR, AS_STATUS));
+	dev_err(kbdev->dev,
+		"AS_ACTIVE bit stuck for MCU AS. Might be caused by unstable GPU clk/pwr or faulty system");
 
 #if IS_ENABLED(CONFIG_MALI_MTK_DEBUG)
-	if (max_loops == 0) {
-		dev_info(kbdev->dev, "AS_ACTIVE bit stuck when MCU load the MMU tables\n");
 #if IS_ENABLED(CONFIG_MALI_MTK_LOG_BUFFER)
-		mtk_logbuffer_print(&kbdev->logbuf_exception,
-			"[%llxt] AS_ACTIVE bit stuck when MCU load the MMU tables\n",
-			mtk_logbuffer_get_timestamp(kbdev, &kbdev->logbuf_exception));
+	mtk_logbuffer_print(&kbdev->logbuf_exception,
+		"[%llxt] AS_ACTIVE bit stuck when MCU load the MMU tables\n",
+		mtk_logbuffer_get_timestamp(kbdev, &kbdev->logbuf_exception));
 #endif /* CONFIG_MALI_MTK_LOG_BUFFER */
-		mtk_common_debug(MTK_COMMON_DBG_DUMP_PM_STATUS, -1, MTK_DBG_HOOK_LOADMMUTABLE_FAIL);
-		mtk_common_debug(MTK_COMMON_DBG_DUMP_INFRA_STATUS, -1, MTK_DBG_HOOK_LOADMMUTABLE_FAIL);
-		mtk_common_debug(MTK_COMMON_DBG_DUMP_DB_BY_SETTING, -1, MTK_DBG_HOOK_LOADMMUTABLE_FAIL);
-	}
-#else
-	if (max_loops == 0)
-		dev_err(kbdev->dev, "AS_ACTIVE bit stuck, might be caused by slow/unstable GPU clock or possible faulty FPGA connector\n");
+	mtk_common_debug(MTK_COMMON_DBG_DUMP_PM_STATUS, -1, MTK_DBG_HOOK_LOADMMUTABLE_FAIL);
+	mtk_common_debug(MTK_COMMON_DBG_DUMP_INFRA_STATUS, -1, MTK_DBG_HOOK_LOADMMUTABLE_FAIL);
+	mtk_common_debug(MTK_COMMON_DBG_DUMP_DB_BY_SETTING, -1, MTK_DBG_HOOK_LOADMMUTABLE_FAIL);
 #endif /* CONFIG_MALI_MTK_DEBUG */
+
+	if (kbase_prepare_to_reset_gpu_locked(kbdev, RESET_FLAGS_HWC_UNRECOVERABLE_ERROR))
+		kbase_reset_gpu_locked(kbdev);
+
+	return -ETIMEDOUT;
 }
 
 static void unload_mmu_tables(struct kbase_device *kbdev)
@@ -341,7 +362,7 @@ static void unload_mmu_tables(struct kbase_device *kbdev)
 	mutex_unlock(&kbdev->mmu_hw_mutex);
 }
 
-static void load_mmu_tables(struct kbase_device *kbdev)
+static int load_mmu_tables(struct kbase_device *kbdev)
 {
 	unsigned long irq_flags;
 
@@ -352,7 +373,7 @@ static void load_mmu_tables(struct kbase_device *kbdev)
 	mutex_unlock(&kbdev->mmu_hw_mutex);
 
 	/* Wait for a while for the update command to take effect */
-	wait_ready(kbdev);
+	return wait_ready(kbdev);
 }
 
 /**
@@ -1762,12 +1783,12 @@ static void kbase_csf_firmware_reload_worker(struct work_struct *work)
 void kbase_csf_firmware_trigger_reload(struct kbase_device *kbdev)
 {
 	lockdep_assert_held(&kbdev->hwaccess_lock);
-
+/* Reduce log in log buffer
 #if IS_ENABLED(CONFIG_MALI_MTK_LOG_BUFFER)
 	mtk_logbuffer_print(&kbdev->logbuf_regular,
 		"[%llxt] Re-enabling MCU here\n",
 		mtk_logbuffer_get_timestamp(kbdev, &kbdev->logbuf_regular));
-#endif /* CONFIG_MALI_MTK_LOG_BUFFER */
+#endif *//* CONFIG_MALI_MTK_LOG_BUFFER */
 
 	kbdev->csf.firmware_reloaded = false;
 
@@ -1802,11 +1823,12 @@ void kbase_csf_firmware_reload_completed(struct kbase_device *kbdev)
 #endif /* CONFIG_MALI_MTK_LOG_BUFFER */
 	}
 
+/* Reduce log in log buffer
 #if IS_ENABLED(CONFIG_MALI_MTK_LOG_BUFFER)
 	mtk_logbuffer_print(&kbdev->logbuf_regular,
 		"[%llxt] FW reboot completed\n",
 		mtk_logbuffer_get_timestamp(kbdev, &kbdev->logbuf_regular));
-#endif /* CONFIG_MALI_MTK_LOG_BUFFER */
+#endif *//* CONFIG_MALI_MTK_LOG_BUFFER */
 
 	KBASE_KTRACE_ADD(kbdev, CSF_FIRMWARE_REBOOT, NULL, 0u);
 
@@ -2080,6 +2102,7 @@ int kbase_csf_firmware_early_init(struct kbase_device *kbdev)
 #if IS_ENABLED(CONFIG_MALI_MTK_GLB_PWROFF_TIMEOUT)
 	struct device_node *node;
 	int gpu_glb_time = DEFAULT_GLB_PWROFF_TIMEOUT_US;
+	u32 segment_id = ged_get_segment_id();
 #endif
 
 	init_waitqueue_head(&kbdev->csf.event_wait);
@@ -2095,13 +2118,18 @@ int kbase_csf_firmware_early_init(struct kbase_device *kbdev)
 #if IS_ENABLED(CONFIG_MALI_MTK_GLB_PWROFF_TIMEOUT)
 	node = of_find_compatible_node(NULL, NULL, "arm,mali-valhall");
 	if (node) {
-		if (!of_property_read_u32(node, "default-glb-pwroff-timeout-us",
-			&gpu_glb_time)){
+		if (segment_id == MT6985W_CZA_SEGMENT)
+			kbdev->csf.mcu_core_pwroff_dur_us = DEFAULT_GLB_PWROFF_TIMEOUT_US;
+		else if (!of_property_read_u32(node, "default-glb-pwroff-timeout-us",
+			&gpu_glb_time))
 			kbdev->csf.mcu_core_pwroff_dur_us = gpu_glb_time;
-			kbdev->csf.mcu_core_pwroff_dur_count = convert_dur_to_core_pwroff_count(
+
+		kbdev->csf.mcu_core_pwroff_dur_count = convert_dur_to_core_pwroff_count(
 				kbdev, gpu_glb_time);
-		}
 	}
+	dev_info(
+			kbdev->dev,
+			"Segment ID %08X, Core Off: %dus\n", segment_id, kbdev->csf.mcu_core_pwroff_dur_us);
 #endif
 
 	INIT_LIST_HEAD(&kbdev->csf.firmware_interfaces);
@@ -2130,7 +2158,7 @@ int kbase_csf_firmware_late_init(struct kbase_device *kbdev)
 #if IS_ENABLED(CONFIG_MALI_MTK_IDLE_HYSTERESIS_TIME)
 	node = of_find_compatible_node(NULL, NULL, "arm,mali-valhall");
 	if (node) {
-		if (!of_property_read_u32(node, "firmware_idle_hytseresis_time_ms",
+		if (!of_property_read_u32(node, "firmware-idle-hytseresis-time-ms",
 			&gpu_idle_time))
 			kbdev->csf.gpu_idle_hysteresis_ms = gpu_idle_time;
 	}
@@ -2283,7 +2311,9 @@ int kbase_csf_firmware_load_init(struct kbase_device *kbdev)
 	kbase_pm_wait_for_l2_powered(kbdev);
 
 	/* Load the MMU tables into the selected address space */
-	load_mmu_tables(kbdev);
+	ret = load_mmu_tables(kbdev);
+	if (ret != 0)
+		goto err_out;
 
 	boot_csf_firmware(kbdev);
 
@@ -2592,11 +2622,12 @@ void kbase_csf_firmware_trigger_mcu_halt(struct kbase_device *kbdev)
 	WARN_ON(kbase_csf_scheduler_get_nr_active_csgs_locked(kbdev));
 	set_global_request(global_iface, GLB_REQ_HALT_MASK);
 	dev_vdbg(kbdev->dev, "Sending request to HALT MCU");
+/* Reduce log in log buffer
 #if IS_ENABLED(CONFIG_MALI_MTK_LOG_BUFFER)
 	mtk_logbuffer_print(&kbdev->logbuf_regular,
 		"[%llxt] Sending request to HALT MCU\n",
 		mtk_logbuffer_get_timestamp(kbdev, &kbdev->logbuf_regular));
-#endif /* CONFIG_MALI_MTK_LOG_BUFFER */
+#endif *//* CONFIG_MALI_MTK_LOG_BUFFER */
 	kbase_csf_ring_doorbell(kbdev, CSF_KERNEL_DOORBELL_NR);
 	kbase_csf_scheduler_spin_unlock(kbdev, flags);
 }
@@ -2623,11 +2654,7 @@ void kbase_csf_firmware_trigger_mcu_sleep(struct kbase_device *kbdev)
 	kbase_csf_scheduler_spin_lock(kbdev, &flags);
 	set_global_request(global_iface, GLB_REQ_SLEEP_MASK);
 	dev_vdbg(kbdev->dev, "Sending sleep request to MCU");
-#if IS_ENABLED(CONFIG_MALI_MTK_LOG_BUFFER)
-	mtk_logbuffer_print(&kbdev->logbuf_regular,
-		"[%llxt] Sending sleep request to MCU\n",
-		mtk_logbuffer_get_timestamp(kbdev, &kbdev->logbuf_regular));
-#endif /* CONFIG_MALI_MTK_LOG_BUFFER */
+
 	kbase_csf_ring_doorbell(kbdev, CSF_KERNEL_DOORBELL_NR);
 	kbase_csf_scheduler_spin_unlock(kbdev, flags);
 }

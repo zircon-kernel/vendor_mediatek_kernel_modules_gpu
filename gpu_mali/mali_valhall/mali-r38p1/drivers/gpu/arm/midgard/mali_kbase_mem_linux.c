@@ -304,6 +304,8 @@ struct kbase_va_region *kbase_mem_alloc(struct kbase_context *kctx, u64 va_pages
 	struct device *dev;
 #if IS_ENABLED(CONFIG_MALI_MTK_ACP_SVP_WA)
 	int r_index;
+	struct kbase_va_region **tmp_coherent_regions;
+	size_t backup_size;
 #endif
 
 	KBASE_DEBUG_ASSERT(kctx);
@@ -516,17 +518,43 @@ struct kbase_va_region *kbase_mem_alloc(struct kbase_context *kctx, u64 va_pages
 		if ((reg->flags & KBASE_REG_SHARE_BOTH) != 0 &&
 			kctx->kbdev->system_coherency != COHERENCY_NONE) {
 			mutex_lock(&kctx->coherenct_region_lock);
-			for (r_index = 0; r_index < MAX_COHERENT_REGION; r_index++) {
+			for (r_index = 0; r_index < kctx->coherent_region_nr; r_index++) {
 				if (!kctx->coherenct_regions[r_index]) {  //array element empty
 					kctx->coherenct_regions[r_index] = reg;
-					kctx->coherent_region_nr++;
 					dev_vdbg(dev, "Add coherent region in index %d, reg 0x%p, starting Page 0x%llx flags: 0x%x, tgid %d, reg_nr: %u",
 						r_index, reg ,reg->cpu_alloc->pages[0], reg->flags, kctx->tgid, kctx->coherent_region_nr);
 					break;
 				}
 			}
-			if (r_index == MAX_COHERENT_REGION)
-				dev_warn(dev, "Coherent region overflow on tgid: %d\n", kctx->tgid);
+			if (r_index == kctx->coherent_region_nr) {
+				dev_vdbg(dev, "Coherent region overflow on tgid: %d, size %u\n", kctx->tgid, kctx->coherent_region_nr);
+				backup_size = kctx->coherent_region_nr * sizeof(struct kbase_va_region *);
+				tmp_coherent_regions = kmalloc(backup_size, GFP_KERNEL);
+				if (!tmp_coherent_regions) {
+					dev_err(dev, "Re-allocate temp list fail: %d, size %u\n",
+						kctx->tgid, kctx->coherent_region_nr);
+					mutex_unlock(&kctx->coherenct_region_lock);
+					goto no_mem;
+				}
+				memcpy(tmp_coherent_regions, kctx->coherenct_regions, backup_size);
+				kfree(kctx->coherenct_regions);
+				// Enlarge list size
+				kctx->coherent_region_nr += DEFAULT_COHERENT_REGION_SIZE;
+				kctx->coherenct_regions =
+					kmalloc(kctx->coherent_region_nr * sizeof(struct kbase_va_region *), GFP_KERNEL);
+
+				if (!kctx->coherenct_regions) {
+					dev_err(dev, "Re-allocate region list fail: %d, size %u\n",
+						kctx->tgid, kctx->coherent_region_nr);
+					kfree(tmp_coherent_regions);
+					mutex_unlock(&kctx->coherenct_region_lock);
+					goto no_mem;
+				}
+				for(r_index = 0; r_index < kctx->coherent_region_nr; r_index++)
+					kctx->coherenct_regions[r_index] = NULL;
+				memcpy(kctx->coherenct_regions, tmp_coherent_regions, backup_size);
+				kfree(tmp_coherent_regions);
+			}
 			mutex_unlock(&kctx->coherenct_region_lock);
 		}
 #endif
@@ -694,6 +722,11 @@ unsigned long kbase_mem_evictable_reclaim_count_objects(struct shrinker *s,
 
 	kctx = container_of(s, struct kbase_context, reclaim);
 
+#if IS_ENABLED(CONFIG_MALI_MTK_RECLAIM_POLICY)
+	if (kctx->kbdev->reclaim_policy == 1)
+		return 0;
+#endif /* CONFIG_MALI_MTK_RECLAIM_POLICY */
+
 #if IS_ENABLED(CONFIG_MALI_MTK_COMMON)
 	// MTK add to prevent false alarm
 	lockdep_off();
@@ -746,6 +779,10 @@ unsigned long kbase_mem_evictable_reclaim_scan_objects(struct shrinker *s,
 	unsigned long freed = 0;
 
 	kctx = container_of(s, struct kbase_context, reclaim);
+#if IS_ENABLED(CONFIG_MALI_MTK_RECLAIM_POLICY)
+		if (kctx->kbdev->reclaim_policy == 1)
+			return SHRINK_STOP;
+#endif /* CONFIG_MALI_MTK_RECLAIM_POLICY */
 
 	mutex_lock(&kctx->jit_evict_lock);
 
@@ -809,6 +846,7 @@ int kbase_mem_evictable_init(struct kbase_context *kctx)
 	 * struct shrinker does not define batch
 	 */
 	kctx->reclaim.batch = 0;
+
 	register_shrinker(&kctx->reclaim);
 	return 0;
 }
@@ -995,7 +1033,7 @@ int kbase_mem_flags_change(struct kbase_context *kctx, u64 gpu_addr, unsigned in
 	 * & GPU queue ringbuffer and none of them needs to be explicitly marked
 	 * as evictable by Userspace.
 	 */
-	if (reg->flags & KBASE_REG_NO_USER_FREE)
+	if (kbase_va_region_is_no_user_free(kctx, reg))
 		goto out_unlock;
 
 	/* Is the region being transitioning between not needed and needed? */
@@ -1953,9 +1991,9 @@ u64 kbase_mem_alias(struct kbase_context *kctx, u64 *flags, u64 stride,
 			/* validate found region */
 			if (kbase_is_region_invalid_or_free(aliasing_reg))
 				goto bad_handle; /* Not found/already free */
-			if (aliasing_reg->flags & KBASE_REG_DONT_NEED)
+			if (kbase_is_region_shrinkable(aliasing_reg))
 				goto bad_handle; /* Ephemeral region */
-			if (aliasing_reg->flags & KBASE_REG_NO_USER_FREE)
+			if (kbase_va_region_is_no_user_free(kctx, aliasing_reg))
 				goto bad_handle; /* JIT regions can't be
 						  * aliased. NO_USER_FREE flag
 						  * covers the entire lifetime
@@ -2327,10 +2365,10 @@ int kbase_mem_commit(struct kbase_context *kctx, u64 gpu_addr, u64 new_pages)
 	if (atomic_read(&reg->cpu_alloc->kernel_mappings) > 0)
 		goto out_unlock;
 
-	if (reg->flags & KBASE_REG_DONT_NEED)
+	if (kbase_is_region_shrinkable(reg))
 		goto out_unlock;
 
-	if (reg->flags & KBASE_REG_NO_USER_FREE)
+	if (kbase_va_region_is_no_user_free(kctx, reg))
 		goto out_unlock;
 
 #ifdef CONFIG_MALI_MEMORY_FULLY_BACKED
@@ -3225,6 +3263,9 @@ void *kbase_vmap_prot(struct kbase_context *kctx, u64 gpu_addr, size_t size,
 
 	reg = kbase_region_tracker_find_region_enclosing_address(kctx, gpu_addr);
 	if (kbase_is_region_invalid_or_free(reg))
+		goto out_unlock;
+
+	if (reg->gpu_alloc->type != KBASE_MEM_TYPE_NATIVE)
 		goto out_unlock;
 
 	addr = kbase_vmap_reg(kctx, reg, gpu_addr, size, prot_request, map, 0u);

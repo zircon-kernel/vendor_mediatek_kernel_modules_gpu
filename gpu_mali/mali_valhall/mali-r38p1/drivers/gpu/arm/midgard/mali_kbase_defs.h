@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
 /*
  *
- * (C) COPYRIGHT 2011-2022 ARM Limited. All rights reserved.
+ * (C) COPYRIGHT 2011-2023 ARM Limited. All rights reserved.
  *
  * This program is free software and is provided to you under the terms of the
  * GNU General Public License version 2 as published by the Free Software
@@ -87,6 +87,7 @@
 
 #if IS_ENABLED(CONFIG_MALI_MTK_ACP_SVP_WA)
 #define MAX_COHERENT_REGION 1024
+#define DEFAULT_COHERENT_REGION_SIZE 64
 #endif
 
 /** Number of milliseconds before we time out on a GPU soft/hard reset */
@@ -107,6 +108,14 @@
  * small number of Address Spaces
  */
 #define BASE_MAX_NR_AS              16
+
+#if IS_ENABLED(CONFIG_MALI_MTK_NETFLIX_SCHEDULER_TIMER_WA) && MALI_USE_CSF
+/* CSF scheduler time slice value */
+#define CSF_SCHEDULER_TIME_TICK_MS (100) /* 100 milliseconds */
+
+/** Max length of the process name */
+#define MAX_PROCESS_NAME_LEN        30
+#endif
 
 /* mmu */
 #define MIDGARD_MMU_LEVEL(x) (x)
@@ -327,6 +336,16 @@ static inline int kbase_as_has_page_fault(struct kbase_as *as,
 struct kbasep_mem_device {
 	atomic_t used_pages;
 	atomic_t ir_threshold;
+#if IS_ENABLED(CONFIG_MALI_MTK_MEM_ALLOCATE_POLICY)
+	size_t nr_rank[2];
+	struct list_head waste_list;
+	size_t nr_waste_list;
+	spinlock_t waste_list_lk;
+	bool bDisWA;
+	/* debugging purpose: */
+	unsigned int ratio;
+	size_t waste_target;
+#endif
 };
 
 struct kbase_clk_rate_listener;
@@ -598,6 +617,13 @@ struct kbase_mmu_mode {
 struct kbase_mmu_mode const *kbase_mmu_mode_get_aarch64(void);
 
 #define DEVNAME_SIZE	16
+
+#if defined(CONFIG_MALI_MTK_GPU_BM_JM)
+struct job_status_qos {
+	phys_addr_t phyaddr;
+	size_t size;
+};
+#endif /* CONFIG_MALI_MTK_GPU_BM_JM */
 
 /**
  * enum kbase_devfreq_work_type - The type of work to perform in the devfreq
@@ -969,6 +995,8 @@ struct kbase_process {
  * @pcm_dev:                The priority control manager device.
  * @oom_notifier_block:     notifier_block containing kernel-registered out-of-
  *                          memory handler.
+ * @mmu_as_inactive_wait_time_ms: Maximum waiting time in ms for the completion of
+ *                          a MMU operation
  */
 struct kbase_device {
 	u32 hw_quirks_sc;
@@ -1240,10 +1268,30 @@ struct kbase_device {
 
 	struct notifier_block oom_notifier_block;
 
+	u32 mmu_as_inactive_wait_time_ms;
+
+#if defined(CONFIG_MALI_MTK_GPU_BM_JM)
+	struct job_status_qos job_status_addr;
+	struct v1_data* v1;
+#endif /* CONFIG_MALI_MTK_GPU_BM_JM */
+
 #if IS_ENABLED(CONFIG_MALI_MTK_LOG_BUFFER)
 	struct mtk_logbuffer_info logbuf_regular;
 	struct mtk_logbuffer_info logbuf_exception;
 #endif /* CONFIG_MALI_MTK_LOG_BUFFER */
+
+#if IS_ENABLED(CONFIG_MALI_MTK_TIMEOUT_RESET)
+	bool reset_force_evict_group_work;
+	bool reset_force_hard_reset;
+	spinlock_t reset_force_change;
+#endif /* CONFIG_MALI_MTK_TIMEOUT_RESET */
+#if IS_ENABLED(CONFIG_MALI_MTK_RECLAIM_POLICY)
+	unsigned int reclaim_policy;
+#endif /* CONFIG_MALI_MTK_RECLAIM_POLICY */
+
+  #if IS_ENABLED(CONFIG_MALI_MTK_MEM_ALLOCATE_POLICY)
+	unsigned int mem_allocate_policy;
+#endif /* CONFIG_MALI_MTK_MEM_ALLOCATE_POLICY */
 };
 
 /**
@@ -1808,6 +1856,10 @@ struct kbase_context {
 	wait_queue_head_t event_queue;
 	pid_t tgid;
 	pid_t pid;
+#if IS_ENABLED(CONFIG_MALI_MTK_NETFLIX_SCHEDULER_TIMER_WA) && MALI_USE_CSF
+	char process_name[MAX_PROCESS_NAME_LEN];
+	bool scheduler_timer_WA;
+#endif
 	atomic_t used_pages;
 	atomic_t nonmapped_pages;
 	atomic_t permanent_mapped_pages;
@@ -1896,11 +1948,13 @@ struct kbase_context {
 #if !MALI_USE_CSF
 	void *platform_data;
 #endif
+	char comm[TASK_COMM_LEN];
 #if IS_ENABLED(CONFIG_MALI_MTK_ACP_SVP_WA)
 	struct mutex coherenct_region_lock;
-	struct kbase_va_region *coherenct_regions[MAX_COHERENT_REGION];
+	struct kbase_va_region **coherenct_regions;
 	unsigned int coherent_region_nr;
 #endif
+	bool has_page_faults;
 };
 
 #ifdef CONFIG_MALI_CINSTR_GWT
@@ -2003,5 +2057,4 @@ static inline u64 kbase_get_lock_region_min_size_log2(struct kbase_gpu_props con
 #define KBASE_AS_INACTIVE_MAX_LOOPS     100000000
 /* Maximum number of loops polling the GPU PRFCNT_ACTIVE bit before we assume the GPU has hung */
 #define KBASE_PRFCNT_ACTIVE_MAX_LOOPS   100000000
-
 #endif /* _KBASE_DEFS_H_ */

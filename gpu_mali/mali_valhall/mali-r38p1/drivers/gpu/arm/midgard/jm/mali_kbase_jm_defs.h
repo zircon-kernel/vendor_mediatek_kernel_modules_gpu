@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
 /*
  *
- * (C) COPYRIGHT 2019-2022 ARM Limited. All rights reserved.
+ * (C) COPYRIGHT 2019-2023 ARM Limited. All rights reserved.
  *
  * This program is free software and is provided to you under the terms of the
  * GNU General Public License version 2 as published by the Free Software
@@ -127,10 +127,13 @@
 /**
  * enum kbase_timeout_selector - The choice of which timeout to get scaled
  *                               using the lowest GPU frequency.
+ * @MMU_AS_INACTIVE_WAIT_TIMEOUT: Maximum waiting time in ms for the completion
+ *                                of a MMU operation
  * @KBASE_TIMEOUT_SELECTOR_COUNT: Number of timeout selectors. Must be last in
  *                                the enum.
  */
 enum kbase_timeout_selector {
+	MMU_AS_INACTIVE_WAIT_TIMEOUT,
 
 	/* Must be the last in the enum */
 	KBASE_TIMEOUT_SELECTOR_COUNT
@@ -591,7 +594,7 @@ struct kbase_jd_atom {
 
 	wait_queue_head_t completed;
 	enum kbase_jd_atom_state status;
-#if IS_ENABLED(CONFIG_GPU_TRACEPOINTS)
+#if IS_ENABLED(CONFIG_GPU_TRACEPOINTS) || defined(CONFIG_MALI_MTK_GPU_BM_JM)
 	int work_id;
 #endif
 	int slot_nr;
@@ -632,6 +635,10 @@ struct kbase_jd_atom {
 	struct rb_node runnable_tree_node;
 
 	u32 age;
+#if defined(CONFIG_MALI_MTK_GPU_BM_JM)
+	/* frame number to the atom */
+	u32 frame_nr;
+#endif
 };
 
 static inline bool kbase_jd_katom_is_protected(
@@ -832,7 +839,7 @@ struct kbase_jd_context {
 	u32 job_nr;
 	size_t tb_wrap_offset;
 
-#if IS_ENABLED(CONFIG_GPU_TRACEPOINTS)
+#if IS_ENABLED(CONFIG_GPU_TRACEPOINTS) || defined(CONFIG_MALI_MTK_GPU_BM_JM)
 	atomic_t work_id;
 #endif
 
@@ -868,6 +875,10 @@ struct jsctx_queue {
  * @pf_data:           Data relating to Page fault.
  * @bf_data:           Data relating to Bus fault.
  * @current_setup:     Stores the MMU configuration for this address space.
+ * @is_unresponsive:   Flag to indicate MMU is not responding.
+ *                     Set if a MMU command isn't completed within
+ *                     &kbase_device:mmu_as_inactive_wait_time_ms.
+ *                     Clear by kbase_ctx_sched_restore_all_as() after GPU reset completes.
  */
 struct kbase_as {
 	int number;
@@ -877,6 +888,7 @@ struct kbase_as {
 	struct kbase_fault pf_data;
 	struct kbase_fault bf_data;
 	struct kbase_mmu_setup current_setup;
+	bool is_unresponsive;
 };
 
 #endif /* _KBASE_JM_DEFS_H_ */
